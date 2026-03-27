@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "python311"]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "cd client && npm install --legacy-peer-deps && npm run build"
+]
+
+[start]
+cmd = "python server.py"
