@@ -4,7 +4,12 @@ nixPkgs = ["nodejs_20", "python311"]
 [phases.install]
 cmds = [
   "pip install -r requirements.txt",
-  "cd client && npm install --legacy-peer-deps && npm run build"
+  "cd client && npm install --legacy-peer-deps"
+]
+
+[phases.build]
+cmds = [
+  "cd client && VITE_SUPABASE_URL=$VITE_SUPABASE_URL VITE_SUPABASE_ANON_KEY=$VITE_SUPABASE_ANON_KEY npm run build"
 ]
 
 [start]
