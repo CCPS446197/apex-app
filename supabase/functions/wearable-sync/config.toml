@@ -1,0 +1,3 @@
+# Runs every morning at 6 AM UTC — data is fresh when the user wakes up
+[functions.wearable-sync]
+schedule = "0 6 * * *"

@@ -1,4 +1,5 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
+import { apiFetch } from '../../lib/api'
 import { useApp } from '../../context/AppContext'
 import { Meal } from '../../types'
 
@@ -30,6 +31,23 @@ const FOOD_DB: Meal[] = [
   { name: 'Whole Milk (250ml)', icon: '🥛', items: '250ml whole milk', kcal: 149, p: 8, c: 11.5, f: 8 },
 ]
 
+/** Resize + JPEG-compress a data URL to ~150–300 KB before upload.
+ *  Phone photos can be 6–15 MB; Claude Vision only needs ~1024 px. */
+function compressImage(dataUrl: string, maxDim = 1024, quality = 0.82): Promise<string> {
+  return new Promise(resolve => {
+    const img = new Image()
+    img.onload = () => {
+      const scale   = Math.min(1, maxDim / Math.max(img.width, img.height))
+      const canvas  = document.createElement('canvas')
+      canvas.width  = Math.round(img.width  * scale)
+      canvas.height = Math.round(img.height * scale)
+      canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height)
+      resolve(canvas.toDataURL('image/jpeg', quality))
+    }
+    img.src = dataUrl
+  })
+}
+
 export default function FoodModal({ open, onClose, showToast }: Props) {
   const { setState } = useApp()
   const [tab, setTab] = useState<Tab>('scan')
@@ -38,7 +56,16 @@ export default function FoodModal({ open, onClose, showToast }: Props) {
   const [scanLoading, setScanLoading] = useState(false)
   const [searchQ, setSearchQ] = useState('')
   const [capturedImage, setCapturedImage] = useState<string | null>(null)
-  const fileRef = useRef<HTMLInputElement>(null)
+  const fileRef    = useRef<HTMLInputElement>(null)
+  const abortRef   = useRef<AbortController | null>(null)
+
+  // Cancel any in-flight scan when the modal closes
+  useEffect(() => {
+    if (!open) {
+      abortRef.current?.abort()
+      abortRef.current = null
+    }
+  }, [open])
 
   // Manual form
   const [mName, setMName] = useState('')
@@ -73,28 +100,35 @@ export default function FoodModal({ open, onClose, showToast }: Props) {
     const file = e.target.files?.[0]
     if (!file) return
     const reader = new FileReader()
-    reader.onload = ev => {
+    reader.onload = async ev => {
       const dataUrl = ev.target?.result as string
       setCapturedImage(dataUrl)
-      scanImage(dataUrl)
+      // Compress before upload: reduces typical 6–15 MB phone photo to ~150–300 KB
+      const compressed = await compressImage(dataUrl)
+      scanImage(compressed)
     }
     reader.readAsDataURL(file)
   }
 
   async function scanImage(dataUrl: string) {
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
+
     setScanPhase('scanning')
     setScanLoading(true)
     try {
-      const res = await fetch('/api/scan', {
+      const res = await apiFetch('/api/scan', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image: dataUrl }),
+        signal: controller.signal,
       })
       if (!res.ok) throw new Error('Scan failed')
       const data = await res.json()
       setScanResult(data)
       setScanPhase('result')
-    } catch {
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') return  // user closed modal or retried
       showToast('Scan failed — try manual entry')
       setScanPhase('idle')
       setCapturedImage(null)
@@ -117,6 +151,8 @@ export default function FoodModal({ open, onClose, showToast }: Props) {
   }
 
   function resetScan() {
+    abortRef.current?.abort()
+    abortRef.current = null
     setScanPhase('idle')
     setCapturedImage(null)
     setScanResult(null)

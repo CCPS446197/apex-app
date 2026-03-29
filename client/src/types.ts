@@ -75,9 +75,10 @@ export interface Recovery {
 
 export interface Profile {
   name: string
+  age: number
   weight: number
   height: number
-  goal: 'bulk' | 'cut'
+  goal: 'bulk' | 'cut' | 'maintain'
   exp: string
   calorieTarget: number
   proteinTarget: number

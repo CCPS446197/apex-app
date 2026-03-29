@@ -10,34 +10,199 @@ Improvements over the original Replit server.py:
 
 from __future__ import annotations
 
+import html
 import json
+import logging
 import os
 import re
 import secrets
 import sqlite3
+import time
 from datetime import datetime, timedelta
+from functools import wraps
 from urllib.parse import urlencode
 
 import anthropic
+import jwt as _jwt
 import requests as http
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, session, send_from_directory
+from flask import Flask, jsonify, request, session, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 load_dotenv()
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+# ── Structured logging ────────────────────────────────────────────────────────
+# JSON lines → easy to ship to any log aggregator; INFO in prod, DEBUG locally.
+_LOG_LEVEL = logging.DEBUG if os.environ.get("FLASK_DEBUG") == "1" else logging.INFO
+logging.basicConfig(
+    level=_LOG_LEVEL,
+    format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}',
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+log = logging.getLogger("apex")
 
-# Allow Vite dev server (port 5000) and common alternatives
-CORS(app, supports_credentials=True, origins=[
+_secret = os.environ.get("FLASK_SECRET_KEY", "")
+if not _secret or _secret == "change-me-to-any-random-string":
+    raise RuntimeError(
+        "FLASK_SECRET_KEY is not set or uses the insecure default. "
+        "Set a strong random value in your .env file."
+    )
+
+app = Flask(__name__)
+app.secret_key = _secret
+
+# Limit request body size: 10 MB max (prevents huge base64 image DoS)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+
+# CORS — only allow explicitly listed origins; strip any empty strings so
+# a missing FRONTEND_URL env var doesn't silently open a wildcard origin.
+_CORS_ORIGINS = [o for o in [
     "http://localhost:5000",
     "http://localhost:5173",
     "http://127.0.0.1:5000",
     os.environ.get("FRONTEND_URL", ""),
-])
+] if o]
 
-ai_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+CORS(app, supports_credentials=True, origins=_CORS_ORIGINS)
+
+# Rate limiting — 60 req/min default on every route unless overridden per-route.
+# Health check is excluded via @limiter.exempt below.
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["60 per minute"],
+    storage_uri="memory://",
+)
+
+ai_client = anthropic.Anthropic(
+    api_key=os.environ.get("ANTHROPIC_API_KEY"),
+    default_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+)
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+
+# Internal secret for server-to-server calls (e.g. Supabase Edge Function scheduler)
+INTERNAL_SECRET     = os.environ.get("APEX_INTERNAL_SECRET", "")
+# Supabase JWT secret — used to verify user Bearer tokens
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+# Slack/Discord/PagerDuty webhook for error alerts (optional)
+ALERT_WEBHOOK       = os.environ.get("ALERT_WEBHOOK_URL", "")
+
+
+# ── Alert helper ──────────────────────────────────────────────────────────────
+
+_alert_last_sent: dict[str, float] = {}  # simple in-process dedup
+
+def _send_alert(message: str, dedup_key: str | None = None) -> None:
+    """POST to a webhook on critical errors. Deduplicates within a 5-minute window
+    so a thundering herd of errors doesn't flood your alerting channel."""
+    if not ALERT_WEBHOOK:
+        return
+    key  = dedup_key or message[:60]
+    now  = time.time()
+    if now - _alert_last_sent.get(key, 0) < 300:
+        return
+    _alert_last_sent[key] = now
+    try:
+        http.post(ALERT_WEBHOOK, json={"text": f":rotating_light: *APEX* {message}"},
+                  timeout=3)
+    except Exception:
+        pass  # alerts must never crash the app
+
+
+# ── Auth decorators ───────────────────────────────────────────────────────────
+
+def _require_auth(fn):
+    """Validate Supabase JWT from Authorization: Bearer <token>.
+    If SUPABASE_JWT_SECRET is not configured (local dev), passes through with a warning."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not SUPABASE_JWT_SECRET:
+            log.warning("auth_bypass path=%s reason=no_jwt_secret_configured", request.path)
+            return fn(*args, **kwargs)
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            log.warning("auth_rejected path=%s reason=missing_bearer", request.path)
+            return jsonify({"error": "Unauthorized"}), 401
+        token = auth[7:]
+        try:
+            _jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"],
+                        options={"verify_aud": False})
+        except _jwt.ExpiredSignatureError:
+            log.warning("auth_rejected path=%s reason=token_expired", request.path)
+            return jsonify({"error": "Token expired — please log in again"}), 401
+        except _jwt.InvalidTokenError as exc:
+            log.warning("auth_rejected path=%s reason=%s", request.path, exc)
+            return jsonify({"error": "Invalid token"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def _require_internal(fn):
+    """Reject requests that don't carry the correct internal secret header."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not INTERNAL_SECRET:
+            return jsonify({"error": "Internal scheduler not configured"}), 503
+        if request.headers.get("X-Apex-Secret") != INTERNAL_SECRET:
+            log.warning("internal_auth_rejected ip=%s", get_remote_address())
+            return jsonify({"error": "Forbidden"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+# ── Request / response logging ────────────────────────────────────────────────
+
+@app.before_request
+def _before():
+    request._start_ts = time.time()  # type: ignore[attr-defined]
+
+
+@app.after_request
+def _after(resp: Response) -> Response:
+    dur_ms = round((time.time() - getattr(request, "_start_ts", time.time())) * 1000)
+    # Skip health-check spam
+    if request.path != "/health":
+        log.info('method=%s path=%s status=%d dur_ms=%d ip=%s',
+                 request.method, request.path, resp.status_code,
+                 dur_ms, get_remote_address())
+    if resp.status_code >= 500:
+        _send_alert(f"HTTP {resp.status_code} on {request.method} {request.path}",
+                    dedup_key=f"5xx_{request.path}")
+    return resp
+
+
+# ── Centralised error handlers (users never see raw stack traces) ─────────────
+
+@app.errorhandler(400)
+def _err_400(e):
+    return jsonify({"error": "Bad request"}), 400
+
+@app.errorhandler(404)
+def _err_404(e):
+    return jsonify({"error": "Not found"}), 404
+
+@app.errorhandler(405)
+def _err_405(e):
+    return jsonify({"error": "Method not allowed"}), 405
+
+@app.errorhandler(413)
+def _err_413(e):
+    return jsonify({"error": "Payload too large (10 MB max)"}), 413
+
+@app.errorhandler(429)
+def _err_429(e):
+    return jsonify({"error": "Too many requests — slow down"}), 429
+
+@app.errorhandler(Exception)
+def _err_500(e: Exception):
+    log.exception("unhandled_exception path=%s", request.path)
+    _send_alert(f"Unhandled {type(e).__name__} on {request.path}",
+                dedup_key=f"exc_{type(e).__name__}_{request.path}")
+    return jsonify({"error": "Internal server error"}), 500
+
 
 # ── Wearable API config ───────────────────────────────────────────────────────
 
@@ -82,6 +247,8 @@ def _init_db():
                 last_synced   TEXT
             )
         """)
+        # key is already indexed as PRIMARY KEY, but explicit for clarity
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tokens_key ON tokens(key)")
         c.commit()
 
 
@@ -197,47 +364,121 @@ Return ONLY valid JSON with no markdown, no backticks, no explanation:
 
 # ── AI endpoints ──────────────────────────────────────────────────────────────
 
+MAX_MESSAGE_LEN  = 4_000   # characters
+MAX_HISTORY_MSGS = 12
+MAX_IMAGE_BYTES  = 8 * 1024 * 1024  # 8 MB base64
+
+_ALLOWED_CONTEXT_KEYS = {
+    "name", "workoutPlan", "todayExercises", "recovery", "nutrition",
+    "sleep_hours", "hrv_history", "source",
+}
+
+
+def _sanitize_context(raw: object) -> dict:
+    """Accept only known top-level keys from client-supplied context."""
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if k in _ALLOWED_CONTEXT_KEYS}
+
+
 @app.route("/api/chat", methods=["POST"])
+@_require_auth
+@limiter.limit("30 per minute; 200 per hour")
 def chat():
     data = request.get_json(silent=True) or {}
 
-    user_message = data.get("message", "")
-    history      = data.get("history", [])
-    context      = data.get("context", {})
+    user_message = str(data.get("message", ""))[:MAX_MESSAGE_LEN]
+    raw_history  = data.get("history", [])
+    context      = _sanitize_context(data.get("context", {}))
 
-    context_str = f"\n\nUSER CONTEXT:\n{json.dumps(context, indent=2)}" if context else ""
-    messages    = history + [{"role": "user", "content": user_message}]
-    system      = COACH_SYSTEM + context_str
+    if not user_message.strip():
+        return jsonify({"error": "No message provided"}), 400
 
-    if not messages:
-        return jsonify({"error": "No messages provided"}), 400
+    if not isinstance(raw_history, list):
+        return jsonify({"error": "Invalid history"}), 400
+
+    # Validate each history entry (role must be user/assistant, content a string)
+    history = []
+    for entry in raw_history[-MAX_HISTORY_MSGS:]:
+        if not isinstance(entry, dict):
+            continue
+        role    = entry.get("role", "")
+        content = entry.get("content", "")
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        history.append({"role": role, "content": content[:MAX_MESSAGE_LEN]})
+
+    messages = history + [{"role": "user", "content": user_message}]
 
     try:
-        response = ai_client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=2400,
-            system=system,
-            messages=messages[-12:],
+        system_blocks = [
+            {
+                "type": "text",
+                "text": COACH_SYSTEM,
+                "cache_control": {"type": "ephemeral"},
+            },
+        ]
+        if context:
+            system_blocks.append({
+                "type": "text",
+                "text": f"\n\nUSER CONTEXT:\n{json.dumps(context, indent=2)}",
+            })
+
+        def generate():
+            try:
+                with ai_client.messages.stream(
+                    model="claude-opus-4-6",
+                    max_tokens=2400,
+                    system=system_blocks,
+                    messages=messages,
+                ) as stream:
+                    for text in stream.text_stream:
+                        yield f"data: {json.dumps(text)}\n\n"
+                yield "data: [DONE]\n\n"
+            except anthropic.APIError:
+                # Yield a typed error event so the client can surface a message
+                # without leaking internal details.
+                log.warning("anthropic_api_error path=/api/chat")
+                yield 'data: [ERROR]\n\n'
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
         )
-        reply = response.content[0].text
-        return jsonify({"response": reply, "reply": reply})
-    except anthropic.APIError as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        log.exception("chat_setup_error")
+        return jsonify({"error": "AI service unavailable"}), 500
 
 
 @app.route("/api/scan", methods=["POST"])
+@_require_auth
+@limiter.limit("10 per minute; 60 per hour")
 def scan():
     data       = request.get_json(silent=True) or {}
     image_data = data.get("image", "")
     media_type = "image/jpeg"
 
+    if not isinstance(image_data, str) or not image_data:
+        return jsonify({"error": "No image provided"}), 400
+
     if image_data.startswith("data:"):
-        header, image_data = image_data.split(",", 1)
+        parts = image_data.split(",", 1)
+        if len(parts) != 2:
+            return jsonify({"error": "Invalid image data URI"}), 400
+        header, image_data = parts
         if "png"  in header: media_type = "image/png"
         elif "webp" in header: media_type = "image/webp"
+        elif "gif" in header: media_type = "image/gif"
 
     if not image_data:
         return jsonify({"error": "No image provided"}), 400
+
+    if len(image_data) > MAX_IMAGE_BYTES:
+        return jsonify({"error": "Image too large (8 MB max)"}), 413
 
     try:
         response = ai_client.messages.create(
@@ -262,8 +503,8 @@ def scan():
         return jsonify(result)
     except json.JSONDecodeError:
         return jsonify({"error": "Could not parse food data from image"}), 422
-    except anthropic.APIError as e:
-        return jsonify({"error": str(e)}), 500
+    except anthropic.APIError:
+        return jsonify({"error": "AI service unavailable"}), 500
 
 
 # ── WHOOP helpers ─────────────────────────────────────────────────────────────
@@ -309,6 +550,7 @@ def _whoop_get(path: str):
 # ── WHOOP routes ──────────────────────────────────────────────────────────────
 
 @app.route("/api/whoop/status")
+@limiter.limit("30 per minute")
 def whoop_status():
     tok = _get_tok("whoop")
     return jsonify({
@@ -320,6 +562,7 @@ def whoop_status():
 
 
 @app.route("/api/whoop/connect")
+@limiter.limit("10 per minute")
 def whoop_connect():
     if not WHOOP_CLIENT_ID:
         return jsonify({"error": "WHOOP_CLIENT_ID not configured"}), 503
@@ -367,6 +610,7 @@ def whoop_callback():
 
 
 @app.route("/api/whoop/sync", methods=["POST"])
+@limiter.limit("10 per minute")
 def whoop_sync():
     tok = _get_tok("whoop")
     if not tok.get("access_token"):
@@ -417,6 +661,7 @@ def whoop_sync():
 
 
 @app.route("/api/whoop/disconnect", methods=["POST"])
+@limiter.limit("10 per minute")
 def whoop_disconnect():
     _del_tok("whoop")
     return jsonify({"ok": True})
@@ -464,6 +709,7 @@ def _oura_get(path: str, params: dict | None = None):
 # ── Oura routes ───────────────────────────────────────────────────────────────
 
 @app.route("/api/oura/status")
+@limiter.limit("30 per minute")
 def oura_status():
     tok = _get_tok("oura")
     return jsonify({
@@ -475,6 +721,7 @@ def oura_status():
 
 
 @app.route("/api/oura/connect")
+@limiter.limit("10 per minute")
 def oura_connect():
     if not OURA_CLIENT_ID:
         return jsonify({"error": "OURA_CLIENT_ID not configured"}), 503
@@ -522,6 +769,7 @@ def oura_callback():
 
 
 @app.route("/api/oura/sync", methods=["POST"])
+@limiter.limit("10 per minute")
 def oura_sync():
     tok = _get_tok("oura")
     if not tok.get("access_token"):
@@ -561,20 +809,105 @@ def oura_sync():
 
 
 @app.route("/api/oura/disconnect", methods=["POST"])
+@limiter.limit("10 per minute")
 def oura_disconnect():
     _del_tok("oura")
     return jsonify({"ok": True})
 
 
+# ── Internal scheduler endpoint ───────────────────────────────────────────────
+
+@app.route("/api/internal/sync-all", methods=["POST"])
+@_require_internal
+def internal_sync_all():
+    """Called by the Supabase Edge Function cron job each morning.
+    Refreshes tokens and syncs all connected wearables."""
+    results: dict = {}
+
+    # WHOOP
+    whoop_tok = _get_tok("whoop")
+    if whoop_tok.get("access_token"):
+        rec_data, err = _whoop_get("/recovery?limit=1")
+        if not err and rec_data:
+            records = rec_data.get("records", [])
+            if records:
+                s = records[0].get("score", {})
+                results["whoop_recovery"] = {
+                    "score": round(s.get("recovery_score", 0)),
+                    "hrv":   round(s.get("hrv_rmssd_milli", 0)),
+                    "rhr":   round(s.get("resting_heart_rate", 0)),
+                }
+        sleep_data, _ = _whoop_get("/activity/sleep?limit=1")
+        if sleep_data:
+            sleeps = sleep_data.get("records", [])
+            if sleeps:
+                stage    = sleeps[0].get("score", {}).get("stage_summary", {})
+                total_ms = (
+                    stage.get("total_light_sleep_time_milli", 0) +
+                    stage.get("total_slow_wave_sleep_time_milli", 0) +
+                    stage.get("total_rem_sleep_time_milli", 0)
+                )
+                results["whoop_sleep_hours"] = round(total_ms / 3_600_000, 1)
+        last_synced = datetime.utcnow().isoformat() + "Z"
+        _set_tok("whoop", {**whoop_tok, "last_synced": last_synced})
+        results["whoop_synced_at"] = last_synced
+
+    # Oura
+    oura_tok = _get_tok("oura")
+    if oura_tok.get("access_token"):
+        today    = datetime.utcnow().date().isoformat()
+        week_ago = (datetime.utcnow().date() - timedelta(days=7)).isoformat()
+        rd, err = _oura_get("/usercollection/daily_readiness",
+                            {"start_date": week_ago, "end_date": today})
+        if not err and rd:
+            readiness = rd.get("data", [])
+            if readiness:
+                results["oura_recovery"] = {"score": readiness[-1].get("score", 0)}
+        sl, _ = _oura_get("/usercollection/sleep",
+                          {"start_date": week_ago, "end_date": today})
+        if sl:
+            sleeps = sl.get("data", [])
+            if sleeps:
+                latest  = sleeps[-1]
+                hrv_avg = latest.get("average_hrv")
+                dur_sec = latest.get("total_sleep_duration")
+                if hrv_avg:
+                    results.setdefault("oura_recovery", {})["hrv"] = round(hrv_avg)
+                if dur_sec:
+                    results["oura_sleep_hours"] = round(dur_sec / 3600, 1)
+        last_synced = datetime.utcnow().isoformat() + "Z"
+        _set_tok("oura", {**oura_tok, "last_synced": last_synced})
+        results["oura_synced_at"] = last_synced
+
+    results["synced_at"] = datetime.utcnow().isoformat() + "Z"
+    return jsonify(results)
+
+
 # ── Shared OAuth popup helper ─────────────────────────────────────────────────
+
+_FRONTEND_ORIGIN = os.environ.get("FRONTEND_URL", "http://localhost:5000")
+
+
+def _js_str(value: str) -> str:
+    """JSON-encode a string for safe embedding inside an HTML <script> block.
+    Standard json.dumps leaves < > & unescaped, which allows </script> injection."""
+    return (
+        json.dumps(value)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
 
 def _popup_page(msg_type: str, status: str, message: str) -> str:
     title   = "APEX – Connected" if status == "success" else "APEX – Error"
-    heading = "✓ Connected" if status == "success" else "⚠ Error"
-    body    = "Connected successfully. This window will close." if status == "success" else message
+    heading = "✓ Connected"      if status == "success" else "⚠ Error"
+    # HTML body: only show a fixed success string or an HTML-escaped error
+    body    = "Connected successfully. This window will close." if status == "success" \
+              else html.escape(message)
     return f"""<!DOCTYPE html>
 <html>
-<head><title>{title}</title>
+<head><title>{html.escape(title)}</title>
 <style>
   body{{font-family:-apple-system,sans-serif;background:#1A1714;color:#F5F0E8;
         display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}
@@ -587,13 +920,22 @@ def _popup_page(msg_type: str, status: str, message: str) -> str:
 <div class="card"><h2>{heading}</h2><p>{body}</p></div>
 <script>
   window.opener && window.opener.postMessage(
-    {{type:{json.dumps(msg_type)},status:{json.dumps(status)},message:{json.dumps(message)}}},
-    '*'
+    {{type:{_js_str(msg_type)},status:{_js_str(status)},message:{_js_str(message)}}},
+    {_js_str(_FRONTEND_ORIGIN)}
   );
   setTimeout(()=>window.close(), 1500);
 </script>
 </body>
 </html>"""
+
+
+# ── Health check ─────────────────────────────────────────────────────────────
+
+@app.route("/health")
+@limiter.exempt
+def health():
+    """Used by load balancer / blue-green deploy readiness probes."""
+    return jsonify({"status": "ok", "ts": datetime.utcnow().isoformat() + "Z"})
 
 
 # ── Static frontend (production) ──────────────────────────────────────────────

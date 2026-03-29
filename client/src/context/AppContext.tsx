@@ -1,58 +1,22 @@
-import React, { createContext, useContext, useState, useCallback } from 'react'
+import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react'
 import { AppState } from '../types'
+import { useAuth } from './AuthContext'
+import { loadUserData, saveProfile, saveAppState, saveDailyLog } from '../lib/db'
 
 const DEFAULT_STATE: AppState = {
-  profile: { name: 'Alex', weight: 84.2, height: 181, goal: 'bulk', exp: 'advanced', calorieTarget: 2600, proteinTarget: 195 },
-  today: {
-    meals: [
-      { name: 'Breakfast', icon: '🥚', items: '5 eggs · rice cakes · banana', kcal: 578, p: 42, c: 58, f: 18 },
-      { name: 'Lunch', icon: '🍗', items: 'Chicken · brown rice · broccoli', kcal: 612, p: 58, c: 72, f: 9 },
-    ],
-    suppsTaken: ['Creatine', 'Omega-3'],
-    exercisesCompleted: [],
-  },
-  recovery: { score: 87, hrv: 62, sleep: 7.4, rhr: 48, hrvHistory: [54, 68, 51, 74, 70, 62, 62] },
-  weeklyVolume: [18200, 22400, 0, 24180, 0, 0, 0],
-  wearables: [
-    { name: 'WHOOP 4.0', icon: '⌚', synced: true, detail: 'Synced · 2 min ago' },
-    { name: 'Apple Watch', icon: '🍎', synced: true, detail: 'Live' },
-    { name: 'Oura Ring', icon: '💍', synced: false, detail: 'Tap to connect' },
-    { name: 'Garmin', icon: '⌚', synced: false, detail: 'Tap to connect' },
-  ],
-  workoutPlan: [
-    { day: 'MON', name: 'Pull A', muscle: 'Back · Biceps · Rear delts', type: 'pull', done: true },
-    { day: 'TUE', name: 'Push A', muscle: 'Chest · Shoulders · Triceps', type: 'push', done: false, isToday: true },
-    { day: 'WED', name: 'Legs A', muscle: 'Quads · Hams · Glutes · Calves', type: 'legs', done: false },
-    { day: 'THU', name: 'Active Rest', muscle: 'Mobility · light cardio', type: 'rest', done: false },
-    { day: 'FRI', name: 'Push B', muscle: 'Chest · Shoulders · Triceps', type: 'push', done: false },
-    { day: 'SAT', name: 'Pull B', muscle: 'Back · Biceps · Rear delts', type: 'pull', done: false },
-    { day: 'SUN', name: 'Rest', muscle: 'Full recovery', type: 'rest', done: false },
-  ],
-  todayExercises: [
-    { id: 'ex1', name: 'Flat Barbell Bench Press', sets: 4, reps: '6–8', weight: 102.5, restSec: 180, sets_logged: [] },
-    { id: 'ex2', name: 'Incline DB Press', sets: 3, reps: '8–10', weight: 36, restSec: 120, sets_logged: [] },
-    { id: 'ex3', name: 'Overhead Press', sets: 4, reps: '6–8', weight: 75, restSec: 180, sets_logged: [] },
-    { id: 'ex4', name: 'Lateral Raises', sets: 4, reps: '12–15', weight: 13, restSec: 90, sets_logged: [] },
-    { id: 'ex5', name: 'Cable Flyes', sets: 3, reps: '12–15', weight: 15, restSec: 90, sets_logged: [] },
-    { id: 'ex6', name: 'Tricep Pushdowns', sets: 4, reps: '10–12', weight: 30, restSec: 60, sets_logged: [] },
-    { id: 'ex7', name: 'Overhead Tricep Ext.', sets: 3, reps: '10–12', weight: 20, restSec: 60, sets_logged: [] },
-  ],
-  supplements: [
-    { icon: '⚡', name: 'Creatine', dose: '5g / day', desc: 'ATP regeneration, strength & hypertrophy', time: 'morning' },
-    { icon: '🌊', name: 'Omega-3', dose: '3g EPA+DHA', desc: 'Inflammation, joint health, recovery', time: 'morning' },
-    { icon: '☀️', name: 'D3 + K2', dose: '5,000 IU D3', desc: 'Hormonal support, immune, bone density', time: 'morning' },
-    { icon: '💥', name: 'Beta-Alanine', dose: '3.2g pre-workout', desc: 'Endurance, lactic acid buffer', time: 'preworkout' },
-    { icon: '🫀', name: 'Magnesium', dose: '400mg glycinate', desc: 'Deep sleep quality, muscle relaxation', time: 'night' },
-    { icon: '🥛', name: 'Casein Protein', dose: '30–40g / night', desc: 'Slow-release MPS during sleep', time: 'night' },
-  ],
-  peptides: [
-    { name: 'BPC-157', cls: 'Systemic · Research compound', dose: '250–500mcg/day', route: 'SubQ / Oral', cycle: '4–6 weeks on/off', half: '~4 hours' },
-    { name: 'CJC-1295 + Ipamorelin', cls: 'GH Secretagogue · Research compound', dose: '100mcg / 200mcg', route: 'SubQ pre-sleep', cycle: '3 months on/off', half: '~hours' },
-  ],
+  profile: { name: '', age: 25, weight: 80, height: 175, goal: 'bulk', exp: 'intermediate', calorieTarget: 2500, proteinTarget: 160 },
+  today: { meals: [], suppsTaken: [], exercisesCompleted: [] },
+  recovery: { score: 0, hrv: 0, sleep: 0, rhr: 0, hrvHistory: [0, 0, 0, 0, 0, 0, 0] },
+  weeklyVolume: [0, 0, 0, 0, 0, 0, 0],
+  wearables: [],
+  workoutPlan: [],
+  todayExercises: [],
+  supplements: [],
+  peptides: [],
   muscleFatigue: [
-    { name: 'Chest', level: 3 }, { name: 'Shoulders', level: 2 }, { name: 'Triceps', level: 2 },
-    { name: 'Back', level: 1 }, { name: 'Biceps', level: 1 }, { name: 'Quads', level: 1 },
-    { name: 'Hamstrings', level: 1 }, { name: 'Glutes', level: 1 }, { name: 'Calves', level: 1 },
+    { name: 'Chest', level: 0 }, { name: 'Shoulders', level: 0 }, { name: 'Triceps', level: 0 },
+    { name: 'Back', level: 0 }, { name: 'Biceps', level: 0 }, { name: 'Quads', level: 0 },
+    { name: 'Hamstrings', level: 0 }, { name: 'Glutes', level: 0 }, { name: 'Calves', level: 0 },
   ],
   metricHistory: [],
   activeSplitId: '',
@@ -61,52 +25,166 @@ const DEFAULT_STATE: AppState = {
   heightUnit: 'cm',
 }
 
-function loadState(): AppState {
-  try {
-    const saved = localStorage.getItem('apex_state')
-    if (saved) {
-      const parsed = JSON.parse(saved)
-      // Merge with defaults to pick up any new fields added since last save
-      return {
-        ...DEFAULT_STATE,
-        ...parsed,
-        metricHistory: parsed.metricHistory ?? [],
-        activeSplitId: parsed.activeSplitId ?? '',
-        darkMode: parsed.darkMode ?? false,
-        weightUnit: parsed.weightUnit ?? 'kg',
-        heightUnit: parsed.heightUnit ?? 'cm',
-        }
+function fromSupabase(profile: any, appState: any, todayLog: any, metrics: any[]): AppState {
+  const s: AppState = JSON.parse(JSON.stringify(DEFAULT_STATE))
+
+  if (profile) {
+    s.profile = {
+      name:          profile.name          ?? '',
+      age:           profile.age           ?? 25,
+      weight:        profile.weight        ?? 80,
+      height:        profile.height        ?? 175,
+      goal:          profile.goal          ?? 'bulk',
+      exp:           profile.exp           ?? 'intermediate',
+      calorieTarget: profile.calorie_target ?? 2500,
+      proteinTarget: profile.protein_target ?? 160,
     }
-  } catch {}
-  return JSON.parse(JSON.stringify(DEFAULT_STATE))
+    s.darkMode    = profile.dark_mode   ?? false
+    s.weightUnit  = profile.weight_unit ?? 'kg'
+    s.heightUnit  = profile.height_unit ?? 'cm'
+    s.supplements = profile.supplements ?? []
+    s.peptides    = profile.peptides    ?? []
+  }
+
+  if (appState) {
+    s.workoutPlan    = appState.workout_plan    ?? []
+    s.todayExercises = appState.today_exercises ?? []
+    s.weeklyVolume   = appState.weekly_volume   ?? [0,0,0,0,0,0,0]
+    s.muscleFatigue  = appState.muscle_fatigue  ?? DEFAULT_STATE.muscleFatigue
+    s.activeSplitId  = appState.active_split_id ?? ''
+    s.recovery       = appState.recovery        ?? DEFAULT_STATE.recovery
+    s.wearables      = appState.wearables       ?? []
+  }
+
+  if (todayLog) {
+    s.today = {
+      meals:              todayLog.meals              ?? [],
+      suppsTaken:         todayLog.supps_taken        ?? [],
+      exercisesCompleted: todayLog.exercises_completed ?? [],
+    }
+  }
+
+  if (metrics.length) {
+    s.metricHistory = metrics.map(m => ({
+      date:   m.date,
+      hrv:    m.hrv    ?? 0,
+      sleep:  m.sleep  ?? 0,
+      rhr:    m.rhr    ?? 0,
+      weight: m.weight ?? 0,
+      score:  m.score  ?? 0,
+    }))
+  }
+
+  return s
 }
 
 interface AppContextValue {
   state: AppState
   setState: (updater: (prev: AppState) => AppState) => void
   save: (newState: AppState) => void
+  reload: () => Promise<void>
 }
 
 const AppContext = createContext<AppContextValue | null>(null)
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
-  const [state, setStateRaw] = useState<AppState>(loadState)
+  const { user } = useAuth()
+  const [state, setStateRaw] = useState<AppState>(() => {
+    try {
+      const saved = localStorage.getItem('apex_state')
+      if (saved) return { ...DEFAULT_STATE, ...JSON.parse(saved) }
+    } catch {}
+    return { ...DEFAULT_STATE }
+  })
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const today = new Date().toISOString().split('T')[0]
 
-  const save = useCallback((newState: AppState) => {
-    try { localStorage.setItem('apex_state', JSON.stringify(newState)) } catch {}
-    setStateRaw(newState)
+  const applySupabaseData = useCallback((profile: any, appState: any, todayLog: any, metrics: any[]) => {
+    const loaded = fromSupabase(profile, appState, todayLog, metrics)
+    setStateRaw(loaded)
+    try { localStorage.setItem('apex_state', JSON.stringify(loaded)) } catch {}
   }, [])
+
+  // Reload from Supabase — exposed so callers (e.g. after onboarding) can trigger it
+  const reload = useCallback(async () => {
+    if (!user) return
+    const { profile, appState, todayLog, metrics } = await loadUserData(user.id)
+    applySupabaseData(profile, appState, todayLog, metrics)
+  }, [user?.id, applySupabaseData])
+
+  // On login, load from Supabase silently in background (localStorage is shown instantly)
+  useEffect(() => {
+    if (!user) return
+    loadUserData(user.id).then(({ profile, appState, todayLog, metrics }) => {
+      applySupabaseData(profile, appState, todayLog, metrics)
+    })
+  }, [user?.id, applySupabaseData])
+
+  const syncToSupabase = useCallback(async (s: AppState, userId: string) => {
+    await Promise.all([
+      saveProfile(userId, {
+        name:           s.profile.name,
+        age:            s.profile.age,
+        weight:         s.profile.weight,
+        height:         s.profile.height,
+        goal:           s.profile.goal,
+        exp:            s.profile.exp,
+        calorie_target: s.profile.calorieTarget,
+        protein_target: s.profile.proteinTarget,
+        weight_unit:    s.weightUnit,
+        height_unit:    s.heightUnit,
+        dark_mode:      s.darkMode,
+        supplements:    s.supplements,
+        peptides:       s.peptides,
+        onboarded:      true,
+      }),
+      saveAppState(userId, {
+        workout_plan:    s.workoutPlan,
+        today_exercises: s.todayExercises,
+        weekly_volume:   s.weeklyVolume,
+        muscle_fatigue:  s.muscleFatigue,
+        active_split_id: s.activeSplitId,
+        recovery:        s.recovery,
+        wearables:       s.wearables,
+      }),
+      saveDailyLog(userId, today, {
+        meals:               s.today.meals,
+        supps_taken:         s.today.suppsTaken,
+        exercises_completed: s.today.exercisesCompleted,
+      }),
+    ])
+  }, [today])
 
   const setState = useCallback((updater: (prev: AppState) => AppState) => {
     setStateRaw(prev => {
       const next = updater(prev)
-      try { localStorage.setItem('apex_state', JSON.stringify(next)) } catch {}
+      try {
+        localStorage.setItem('apex_state', JSON.stringify(next))
+      } catch (e) {
+        // QuotaExceededError — trim metric history and retry once
+        if (e instanceof DOMException && e.name === 'QuotaExceededError') {
+          try {
+            const trimmed = { ...next, metricHistory: next.metricHistory.slice(-30) }
+            localStorage.setItem('apex_state', JSON.stringify(trimmed))
+          } catch { /* storage fully unavailable — Supabase is the fallback */ }
+        }
+      }
+      if (user?.id) {
+        if (saveTimer.current) clearTimeout(saveTimer.current)
+        saveTimer.current = setTimeout(() => syncToSupabase(next, user.id), 1500)
+      }
       return next
     })
-  }, [])
+  }, [user?.id, syncToSupabase])
+
+  const save = useCallback((newState: AppState) => {
+    try { localStorage.setItem('apex_state', JSON.stringify(newState)) } catch {}
+    setStateRaw(newState)
+    if (user?.id) syncToSupabase(newState, user.id)
+  }, [user?.id, syncToSupabase])
 
   return (
-    <AppContext.Provider value={{ state, setState, save }}>
+    <AppContext.Provider value={{ state, setState, save, reload }}>
       {children}
     </AppContext.Provider>
   )

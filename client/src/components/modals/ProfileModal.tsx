@@ -57,12 +57,11 @@ export default function ProfileModal({ open, onClose, showToast }: Props) {
   const [weight, setWeight] = useState(fmtWeightVal(profile.weight, weightUnit))
   const [heightCm, setHeightCm] = useState(String(profile.height))
   const [heightIn, setHeightIn] = useState(cmToTotalInches(profile.height))
-  const [goal, setGoal] = useState<'bulk' | 'cut'>(profile.goal)
+  const [goal, setGoal] = useState<'bulk' | 'cut' | 'maintain'>(profile.goal)
   const [exp, setExp] = useState(profile.exp)
   const [kcal, setKcal] = useState(String(profile.calorieTarget))
   const [protein, setProtein] = useState(String(profile.proteinTarget))
-  const [pinInput, setPinInput] = useState('')
-  const [pinError, setPinError] = useState('')
+
 
   const { ft, inches } = totalInchesToFtIn(heightIn)
   const weightKg = (() => {
@@ -94,7 +93,8 @@ export default function ProfileModal({ open, onClose, showToast }: Props) {
     setState(prev => ({
       ...prev,
       profile: {
-        name: name.trim() || 'Alex',
+        ...prev.profile,
+        name: name.trim() || prev.profile.name,
         weight: rawWeight
           ? (prev.weightUnit === 'lbs' ? lbsToKg(rawWeight) : rawWeight)
           : prev.profile.weight,
@@ -109,18 +109,6 @@ export default function ProfileModal({ open, onClose, showToast }: Props) {
     onClose()
   }
 
-  function savePin() {
-    const trimmed = pinInput.trim()
-    if (!/^\d{4}$/.test(trimmed)) {
-      setPinError('PIN must be exactly 4 digits')
-      return
-    }
-    setState(prev => ({ ...prev, pin: trimmed }))
-    sessionStorage.removeItem('apex_unlocked')
-    setPinInput('')
-    setPinError('')
-    showToast('PIN updated ✓')
-  }
 
   return (
     <div className={`modal-overlay${open ? ' open' : ''}`} onClick={e => e.target === e.currentTarget && onClose()}>
@@ -322,23 +310,6 @@ export default function ProfileModal({ open, onClose, showToast }: Props) {
               />
             </div>
 
-            <div className="pin-section">
-              <div className="pin-section-label">App PIN</div>
-              <div className="pin-section-sub">4-digit code required on every open · current: ••••</div>
-              <div className="pin-row">
-                <input
-                  className="inp pin-inp"
-                  type="password"
-                  inputMode="numeric"
-                  maxLength={4}
-                  placeholder="New PIN"
-                  value={pinInput}
-                  onChange={e => { setPinInput(e.target.value.replace(/\D/g,'')); setPinError('') }}
-                />
-                <button className="pin-save-btn" onClick={savePin}>Update</button>
-              </div>
-              {pinError && <div className="pin-error-msg">{pinError}</div>}
-            </div>
 
             <button className="btn-primary" style={{ marginTop: 8, marginBottom: 12 }} onClick={save}>
               Save Profile

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { useApp } from '../context/AppContext'
+import { apiFetch } from '../lib/api'
 import { fmtWeight } from '../utils/units'
 import type { Exercise, WorkoutType } from '../types'
 
@@ -225,6 +226,10 @@ export default function AICoach() {
     setInput('')
     setLoading(true)
 
+    // Placeholder so the bubble appears immediately
+    const placeholderIdx = messages.length + 1
+    setMessages(prev => [...prev, { role: 'ai', text: '', time: fmt() }])
+
     try {
       const body = {
         message: trimmed,
@@ -249,23 +254,47 @@ export default function AICoach() {
         })),
       }
 
-      const res = await fetch('/api/chat', {
+      const res = await apiFetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
 
       if (!res.ok) throw new Error('API error')
-      const data = await res.json()
-      const raw = data.response || data.reply || 'No response received.'
-      const { text: cleanText, action } = parseAction(raw)
 
-      setMessages(prev => [...prev, { role: 'ai', text: cleanText, time: fmt(), action }])
+      // Read the SSE stream and append tokens as they arrive
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+      let accumulated = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const chunk = decoder.decode(value, { stream: true })
+        for (const line of chunk.split('\n')) {
+          if (!line.startsWith('data: ')) continue
+          const payload = line.slice(6)
+          if (payload === '[DONE]') break
+          if (payload === '[ERROR]') throw new Error('AI service unavailable')
+          try {
+            accumulated += JSON.parse(payload)
+            setMessages(prev =>
+              prev.map((m, i) => i === placeholderIdx ? { ...m, text: accumulated } : m)
+            )
+          } catch { /* malformed chunk — skip */ }
+        }
+      }
+
+      const { text: cleanText, action } = parseAction(accumulated)
+      setMessages(prev =>
+        prev.map((m, i) => i === placeholderIdx ? { ...m, text: cleanText, action } : m)
+      )
     } catch {
-      setMessages(prev => [
-        ...prev,
-        { role: 'ai', text: 'Connection error. Please check your network and try again.', time: fmt() },
-      ])
+      setMessages(prev =>
+        prev.map((m, i) => i === placeholderIdx
+          ? { ...m, text: 'Connection error. Please check your network and try again.' }
+          : m
+        )
+      )
     } finally {
       setLoading(false)
     }

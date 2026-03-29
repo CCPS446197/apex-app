@@ -1,0 +1,23 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+# Railway polls /health before routing traffic to the new instance.
+# The old instance keeps serving until the new one passes — zero-downtime rollout.
+healthcheckPath    = "/health"
+healthcheckTimeout = 30          # seconds to wait for first 200 from /health
+restartPolicyType  = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# ── Blue-Green strategy ────────────────────────────────────────────────────────
+# Railway does not support native blue-green in a single service, but you can
+# achieve it with two services sharing the same custom domain:
+#
+#   1. Create two Railway services: apex-blue and apex-green
+#   2. Both point to the same repo; deploy alternately
+#   3. Use Railway's custom domain + weight-based traffic split (or Cloudflare)
+#      to shift traffic: blue=100/green=0 → blue=90/green=10 → blue=0/green=100
+#   4. Once green is stable, it becomes the new "blue" for the next deploy
+#
+# The /health endpoint above is what Railway (and Cloudflare health checks) use
+# to verify a service is ready before receiving traffic.

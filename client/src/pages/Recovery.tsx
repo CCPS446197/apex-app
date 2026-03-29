@@ -78,7 +78,10 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
 
   // ── Listen for OAuth popups ─────────────────────────────────────────────
   useEffect(() => {
+    // Only accept postMessages from our own backend origin
+    const BACKEND_ORIGIN = `${window.location.protocol}//${window.location.hostname}:8000`
     function handleMessage(e: MessageEvent) {
+      if (e.origin !== window.location.origin && e.origin !== BACKEND_ORIGIN) return
       if (!e.data) return
       if (e.data.type === 'whoop_oauth') {
         if (e.data.status === 'success') {

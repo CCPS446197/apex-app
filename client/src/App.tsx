@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
 import { AppProvider, useApp } from './context/AppContext'
 import { AuthProvider, useAuth } from './context/AuthContext'
+import { supabase } from './lib/supabase'
 import { Page } from './types'
 import { useToast } from './hooks/useToast'
 import StatusBar from './components/StatusBar'
 import BottomNav from './components/BottomNav'
 import LoginScreen from './components/LoginScreen'
+import Onboarding from './components/Onboarding'
 import ProfileModal from './components/modals/ProfileModal'
 import FoodModal from './components/modals/FoodModal'
 import MetricsModal from './components/modals/MetricsModal'
@@ -18,9 +20,21 @@ import Recovery from './pages/Recovery'
 import Nutrition from './pages/Nutrition'
 import Supplements from './pages/Supplements'
 
+const Splash = () => (
+  <div style={{
+    position: 'fixed', inset: 0, background: '#1A1714',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    fontFamily: "'Cormorant Garamond', Georgia, serif",
+    fontSize: 42, fontWeight: 300, letterSpacing: 10, color: '#F5F0E8',
+  }}>
+    APEX
+  </div>
+)
+
 function AppInner() {
-  const { state } = useApp()
-  const { user, loading } = useAuth()
+  const { state, reload } = useApp()
+  const { user, loading: authLoading } = useAuth()
+  const [onboarded, setOnboarded] = useState<boolean | null>(null)
   const [page, setPage] = useState<Page>('home')
   const [profileOpen,  setProfileOpen]  = useState(false)
   const [foodOpen,     setFoodOpen]     = useState(false)
@@ -33,22 +47,23 @@ function AppInner() {
     document.documentElement.setAttribute('data-theme', state.darkMode ? 'dark' : 'light')
   }, [state.darkMode])
 
-  if (loading) {
-    return (
-      <div style={{
-        position: 'fixed', inset: 0, background: '#1A1714',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        fontFamily: "'Cormorant Garamond', Georgia, serif",
-        fontSize: 42, fontWeight: 300, letterSpacing: 10, color: '#F5F0E8',
-      }}>
-        APEX
-      </div>
-    )
-  }
+  useEffect(() => {
+    if (!user) { setOnboarded(null); return }
+    supabase.from('profiles').select('onboarded').eq('id', user.id).single()
+      .then(({ data, error }) => {
+        if (error) setOnboarded(false)
+        else setOnboarded(data?.onboarded ?? false)
+      })
+  }, [user?.id])
 
-  if (!user) {
-    return <LoginScreen />
-  }
+  if (authLoading || (user && onboarded === null)) return <Splash />
+  if (!user) return <LoginScreen />
+  if (!onboarded) return (
+    <Onboarding userId={user.id} onComplete={async () => {
+      await reload()
+      setOnboarded(true)
+    }} />
+  )
 
   const isAI = page === 'ai'
 
