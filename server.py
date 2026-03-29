@@ -10,6 +10,7 @@ Improvements over the original Replit server.py:
 
 from __future__ import annotations
 
+import base64 as _b64
 import html
 import json
 import logging
@@ -226,10 +227,28 @@ OURA_TOKEN_URL      = "https://api.ouraring.com/oauth/token"
 OURA_API_BASE       = "https://api.ouraring.com/v2"
 OURA_SCOPES         = "daily heartrate personal"
 
-# Redirect URIs — register these in your WHOOP/Oura developer dashboards
-_HOST             = os.environ.get("API_HOST", "http://localhost:8000")
-WHOOP_REDIRECT_URI = os.environ.get("WHOOP_REDIRECT_URI", f"{_HOST}/api/whoop/callback")
-OURA_REDIRECT_URI  = os.environ.get("OURA_REDIRECT_URI",  f"{_HOST}/api/oura/callback")
+# Fitbit
+FITBIT_CLIENT_ID     = os.environ.get("FITBIT_CLIENT_ID", "")
+FITBIT_CLIENT_SECRET = os.environ.get("FITBIT_CLIENT_SECRET", "")
+FITBIT_AUTH_URL      = "https://www.fitbit.com/oauth2/authorize"
+FITBIT_TOKEN_URL     = "https://api.fitbit.com/oauth2/token"
+FITBIT_API_BASE      = "https://api.fitbit.com"
+FITBIT_SCOPES        = "sleep heartrate activity"
+
+# Strava
+STRAVA_CLIENT_ID     = os.environ.get("STRAVA_CLIENT_ID", "")
+STRAVA_CLIENT_SECRET = os.environ.get("STRAVA_CLIENT_SECRET", "")
+STRAVA_AUTH_URL      = "https://www.strava.com/oauth/authorize"
+STRAVA_TOKEN_URL     = "https://www.strava.com/oauth/token"
+STRAVA_API_BASE      = "https://www.strava.com/api/v3"
+STRAVA_SCOPES        = "read,activity:read_all"
+
+# Redirect URIs — register these in your WHOOP/Oura/Fitbit/Strava developer dashboards
+_HOST               = os.environ.get("API_HOST", "http://localhost:8000")
+WHOOP_REDIRECT_URI  = os.environ.get("WHOOP_REDIRECT_URI",  f"{_HOST}/api/whoop/callback")
+OURA_REDIRECT_URI   = os.environ.get("OURA_REDIRECT_URI",   f"{_HOST}/api/oura/callback")
+FITBIT_REDIRECT_URI = os.environ.get("FITBIT_REDIRECT_URI", f"{_HOST}/api/fitbit/callback")
+STRAVA_REDIRECT_URI = os.environ.get("STRAVA_REDIRECT_URI", f"{_HOST}/api/strava/callback")
 
 # ── Supabase token store (per-user) ───────────────────────────────────────────
 # All wearable OAuth tokens are stored in the `wearable_tokens` table in Supabase,
@@ -882,6 +901,319 @@ def oura_sync():
 @limiter.limit("10 per minute")
 def oura_disconnect():
     _del_tok(g.user_id, "oura")
+    return jsonify({"ok": True})
+
+
+# ── Fitbit ─────────────────────────────────────────────────────────────────────
+
+def _fitbit_auth_header() -> str:
+    """Fitbit token refresh uses HTTP Basic auth (base64 of client_id:client_secret)."""
+    return "Basic " + _b64.b64encode(
+        f"{FITBIT_CLIENT_ID}:{FITBIT_CLIENT_SECRET}".encode()
+    ).decode()
+
+
+def _fitbit_ensure_token(user_id: str) -> str | None:
+    tok = _get_tok(user_id, "fitbit")
+    if not tok.get("access_token"):
+        return None
+    expires_at = tok.get("expires_at", 0) or 0
+    if datetime.utcnow().timestamp() < expires_at - 60:
+        return tok["access_token"]
+    resp = http.post(FITBIT_TOKEN_URL,
+        data={"grant_type": "refresh_token", "refresh_token": tok.get("refresh_token")},
+        headers={"Authorization": _fitbit_auth_header(),
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        timeout=10)
+    if not resp.ok:
+        return None
+    new = resp.json()
+    _set_tok(user_id, "fitbit", {
+        "access_token":  new["access_token"],
+        "refresh_token": new.get("refresh_token", tok.get("refresh_token")),
+        "expires_at":    datetime.utcnow().timestamp() + new.get("expires_in", 28800),
+        "last_synced":   tok.get("last_synced"),
+    })
+    return new["access_token"]
+
+
+@app.route("/api/fitbit/pat", methods=["POST"])
+@_require_auth
+@limiter.limit("10 per minute")
+def fitbit_pat():
+    data = request.get_json(silent=True) or {}
+    pat  = str(data.get("token", "")).strip()
+    if not pat:
+        return jsonify({"error": "token required"}), 400
+    _set_tok(g.user_id, "fitbit", {"access_token": pat, "refresh_token": None,
+                                    "expires_at": 9_999_999_999.0})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/fitbit/status")
+@_require_auth
+@limiter.limit("30 per minute")
+def fitbit_status():
+    tok = _get_tok(g.user_id, "fitbit")
+    return jsonify({
+        "configured":  bool(FITBIT_CLIENT_ID and FITBIT_CLIENT_SECRET),
+        "connected":   bool(tok.get("access_token")),
+        "redirect_uri": FITBIT_REDIRECT_URI,
+        "last_synced": tok.get("last_synced"),
+    })
+
+
+@app.route("/api/fitbit/connect")
+@_require_auth
+@limiter.limit("10 per minute")
+def fitbit_connect():
+    if not FITBIT_CLIENT_ID:
+        return jsonify({"error": "FITBIT_CLIENT_ID not configured"}), 503
+    state = secrets.token_urlsafe(16)
+    session["fitbit_state"]   = state
+    session["fitbit_user_id"] = g.user_id
+    auth_url = FITBIT_AUTH_URL + "?" + urlencode({
+        "client_id":     FITBIT_CLIENT_ID,
+        "redirect_uri":  FITBIT_REDIRECT_URI,
+        "response_type": "code",
+        "scope":         FITBIT_SCOPES,
+        "state":         state,
+        "expires_in":    "604800",   # 7-day token
+    })
+    return jsonify({"auth_url": auth_url})
+
+
+@app.route("/api/fitbit/callback")
+def fitbit_callback():
+    code  = request.args.get("code")
+    state = request.args.get("state")
+    error = request.args.get("error")
+    if error or not code:
+        return _popup_page("fitbit_oauth", "error", error or "No code received")
+    if state != session.get("fitbit_state"):
+        return _popup_page("fitbit_oauth", "error", "State mismatch — possible CSRF")
+    user_id = session.get("fitbit_user_id")
+    if not user_id:
+        return _popup_page("fitbit_oauth", "error", "Session expired — please try again")
+    resp = http.post(FITBIT_TOKEN_URL,
+        data={"grant_type": "authorization_code", "code": code,
+              "redirect_uri": FITBIT_REDIRECT_URI},
+        headers={"Authorization": _fitbit_auth_header(),
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        timeout=10)
+    if not resp.ok:
+        return _popup_page("fitbit_oauth", "error", f"Token exchange failed: {resp.text}")
+    tok = resp.json()
+    _set_tok(user_id, "fitbit", {
+        "access_token":  tok["access_token"],
+        "refresh_token": tok.get("refresh_token", ""),
+        "expires_at":    datetime.utcnow().timestamp() + tok.get("expires_in", 28800),
+    })
+    session.pop("fitbit_state",   None)
+    session.pop("fitbit_user_id", None)
+    return _popup_page("fitbit_oauth", "success", "")
+
+
+@app.route("/api/fitbit/sync", methods=["POST"])
+@_require_auth
+@limiter.limit("10 per minute")
+def fitbit_sync():
+    tok = _get_tok(g.user_id, "fitbit")
+    if not tok.get("access_token"):
+        return jsonify({"error": "Not connected"}), 401
+    token = _fitbit_ensure_token(g.user_id)
+    if not token:
+        return jsonify({"error": "Token expired — reconnect Fitbit"}), 401
+
+    today   = datetime.utcnow().date().isoformat()
+    headers = {"Authorization": f"Bearer {token}"}
+    result: dict = {}
+
+    # Sleep
+    sr = http.get(f"{FITBIT_API_BASE}/1.2/user/-/sleep/date/{today}.json",
+                  headers=headers, timeout=10)
+    if sr.ok:
+        summary = sr.json().get("summary", {})
+        mins = summary.get("totalMinutesAsleep", 0)
+        if mins:
+            result["sleep_hours"] = round(mins / 60, 1)
+        stages = summary.get("stages", {})
+        if stages:
+            total = sum(stages.values())
+            if total > 0:
+                quality = (stages.get("deep", 0) + stages.get("rem", 0)) / total
+                result.setdefault("recovery", {})["score"] = round(quality * 100)
+
+    # Resting heart rate
+    hr = http.get(f"{FITBIT_API_BASE}/1/user/-/activities/heart/date/{today}/1d.json",
+                  headers=headers, timeout=10)
+    if hr.ok:
+        rhr = hr.json().get("activities-heart", [{}])[-1].get("value", {}).get("restingHeartRate")
+        if rhr:
+            result.setdefault("recovery", {})["rhr"] = round(rhr)
+
+    # HRV (Fitbit Sense / Charge 5+ with Premium)
+    hv = http.get(f"{FITBIT_API_BASE}/1/user/-/hrv/date/{today}.json",
+                  headers=headers, timeout=10)
+    if hv.ok:
+        hrv_list = hv.json().get("hrv", [])
+        if hrv_list:
+            val = hrv_list[0].get("value", {})
+            rmssd = val.get("dailyRmssd") or val.get("deepRmssd")
+            if rmssd:
+                result.setdefault("recovery", {})["hrv"] = round(rmssd)
+
+    last_synced = datetime.utcnow().isoformat() + "Z"
+    _set_tok(g.user_id, "fitbit", {**tok, "last_synced": last_synced})
+    result["last_synced"] = last_synced
+    return jsonify(result)
+
+
+@app.route("/api/fitbit/disconnect", methods=["POST"])
+@_require_auth
+@limiter.limit("10 per minute")
+def fitbit_disconnect():
+    _del_tok(g.user_id, "fitbit")
+    return jsonify({"ok": True})
+
+
+# ── Strava ─────────────────────────────────────────────────────────────────────
+
+def _strava_ensure_token(user_id: str) -> str | None:
+    tok = _get_tok(user_id, "strava")
+    if not tok.get("access_token"):
+        return None
+    expires_at = tok.get("expires_at", 0) or 0
+    if datetime.utcnow().timestamp() < expires_at - 60:
+        return tok["access_token"]
+    resp = http.post(STRAVA_TOKEN_URL, data={
+        "client_id":     STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "grant_type":    "refresh_token",
+        "refresh_token": tok.get("refresh_token"),
+    }, timeout=10)
+    if not resp.ok:
+        return None
+    new = resp.json()
+    _set_tok(user_id, "strava", {
+        "access_token":  new["access_token"],
+        "refresh_token": new.get("refresh_token", tok.get("refresh_token")),
+        "expires_at":    new.get("expires_at", datetime.utcnow().timestamp() + 21600),
+        "last_synced":   tok.get("last_synced"),
+    })
+    return new["access_token"]
+
+
+@app.route("/api/strava/status")
+@_require_auth
+@limiter.limit("30 per minute")
+def strava_status():
+    tok = _get_tok(g.user_id, "strava")
+    return jsonify({
+        "configured":  bool(STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET),
+        "connected":   bool(tok.get("access_token")),
+        "redirect_uri": STRAVA_REDIRECT_URI,
+        "last_synced": tok.get("last_synced"),
+    })
+
+
+@app.route("/api/strava/connect")
+@_require_auth
+@limiter.limit("10 per minute")
+def strava_connect():
+    if not STRAVA_CLIENT_ID:
+        return jsonify({"error": "STRAVA_CLIENT_ID not configured"}), 503
+    state = secrets.token_urlsafe(16)
+    session["strava_state"]   = state
+    session["strava_user_id"] = g.user_id
+    auth_url = STRAVA_AUTH_URL + "?" + urlencode({
+        "client_id":     STRAVA_CLIENT_ID,
+        "redirect_uri":  STRAVA_REDIRECT_URI,
+        "response_type": "code",
+        "approval_prompt": "auto",
+        "scope":         STRAVA_SCOPES,
+        "state":         state,
+    })
+    return jsonify({"auth_url": auth_url})
+
+
+@app.route("/api/strava/callback")
+def strava_callback():
+    code  = request.args.get("code")
+    state = request.args.get("state")
+    error = request.args.get("error")
+    if error or not code:
+        return _popup_page("strava_oauth", "error", error or "No code received")
+    if state != session.get("strava_state"):
+        return _popup_page("strava_oauth", "error", "State mismatch — possible CSRF")
+    user_id = session.get("strava_user_id")
+    if not user_id:
+        return _popup_page("strava_oauth", "error", "Session expired — please try again")
+    resp = http.post(STRAVA_TOKEN_URL, data={
+        "client_id":     STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "code":          code,
+        "grant_type":    "authorization_code",
+    }, timeout=10)
+    if not resp.ok:
+        return _popup_page("strava_oauth", "error", f"Token exchange failed: {resp.text}")
+    tok = resp.json()
+    _set_tok(user_id, "strava", {
+        "access_token":  tok["access_token"],
+        "refresh_token": tok.get("refresh_token", ""),
+        "expires_at":    tok.get("expires_at", datetime.utcnow().timestamp() + 21600),
+    })
+    session.pop("strava_state",   None)
+    session.pop("strava_user_id", None)
+    return _popup_page("strava_oauth", "success", "")
+
+
+@app.route("/api/strava/sync", methods=["POST"])
+@_require_auth
+@limiter.limit("10 per minute")
+def strava_sync():
+    tok = _get_tok(g.user_id, "strava")
+    if not tok.get("access_token"):
+        return jsonify({"error": "Not connected"}), 401
+    token = _strava_ensure_token(g.user_id)
+    if not token:
+        return jsonify({"error": "Token expired — reconnect Strava"}), 401
+
+    headers = {"Authorization": f"Bearer {token}"}
+    result: dict = {}
+
+    # Last 7 activities
+    ar = http.get(f"{STRAVA_API_BASE}/athlete/activities",
+                  params={"per_page": 7}, headers=headers, timeout=10)
+    if ar.ok:
+        acts = ar.json()
+        result["recent_activities"] = [
+            {
+                "name":         a.get("name", ""),
+                "type":         a.get("sport_type") or a.get("type", ""),
+                "distance_km":  round(a.get("distance", 0) / 1000, 1),
+                "duration_min": round(a.get("moving_time", 0) / 60),
+                "date":         (a.get("start_date_local") or "")[:10],
+                "avg_hr":       a.get("average_heartrate"),
+                "suffer_score": a.get("suffer_score"),
+            }
+            for a in acts
+        ]
+        result["weekly_distance_km"] = round(
+            sum(a.get("distance", 0) for a in acts) / 1000, 1
+        )
+
+    last_synced = datetime.utcnow().isoformat() + "Z"
+    _set_tok(g.user_id, "strava", {**tok, "last_synced": last_synced})
+    result["last_synced"] = last_synced
+    return jsonify(result)
+
+
+@app.route("/api/strava/disconnect", methods=["POST"])
+@_require_auth
+@limiter.limit("10 per minute")
+def strava_disconnect():
+    _del_tok(g.user_id, "strava")
     return jsonify({"ok": True})
 
 

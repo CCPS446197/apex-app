@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback } from 'react'
+import { Capacitor } from '@capacitor/core'
 import { useApp } from '../context/AppContext'
 import { apiFetch } from '../lib/api'
+import { requestAppleHealthPermission, readAppleHealth } from '../hooks/useAppleHealth'
 import type { WhoopStatus } from '../types'
 
-interface OuraStatus {
+interface WearableStatus {
   configured: boolean
   connected: boolean
   redirect_uri: string
@@ -43,13 +45,20 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
   const { recovery, muscleFatigue } = state
   const { score, hrv, sleep, rhr, hrvHistory } = recovery
 
-  const [whoopStatus, setWhoopStatus] = useState<WhoopStatus | null>(null)
-  const [ouraStatus,  setOuraStatus]  = useState<OuraStatus  | null>(null)
-  const [whoopSyncing, setWhoopSyncing] = useState(false)
-  const [ouraSyncing,  setOuraSyncing]  = useState(false)
-  const [patOpen, setPatOpen] = useState<'whoop' | 'oura' | null>(null)
-  const [patToken, setPatToken] = useState('')
+  type Provider = 'whoop' | 'oura' | 'fitbit' | 'strava'
+  const [whoopStatus,  setWhoopStatus]  = useState<WhoopStatus    | null>(null)
+  const [ouraStatus,   setOuraStatus]   = useState<WearableStatus | null>(null)
+  const [fitbitStatus, setFitbitStatus] = useState<WearableStatus | null>(null)
+  const [stravaStatus, setStravaStatus] = useState<WearableStatus | null>(null)
+  const [syncing, setSyncing] = useState<Provider | null>(null)
+  const [patOpen,   setPatOpen]   = useState<Provider | null>(null)
+  const [patToken,  setPatToken]  = useState('')
   const [patSaving, setPatSaving] = useState(false)
+
+  // Apple Health (iOS native only)
+  const isNative = Capacitor.isNativePlatform()
+  const [ahConnected, setAhConnected] = useState(false)
+  const [ahSyncing,   setAhSyncing]   = useState(false)
 
   const DAYS   = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
   const maxHrv = Math.max(...hrvHistory, 1)
@@ -65,15 +74,19 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
     ? <><em style={{ color: 'var(--copper)' }}>is recovering.</em></>
     : <><em style={{ color: 'var(--red)' }}>needs rest.</em></>
 
-  // ── Fetch both wearable statuses ────────────────────────────────────────
+  // ── Fetch all wearable statuses ──────────────────────────────────────────
   const fetchStatuses = useCallback(async () => {
     try {
-      const [wr, or] = await Promise.all([
+      const [wr, or, fr, sr] = await Promise.all([
         apiFetch('/api/whoop/status'),
         apiFetch('/api/oura/status'),
+        apiFetch('/api/fitbit/status'),
+        apiFetch('/api/strava/status'),
       ])
       if (wr.ok) setWhoopStatus(await wr.json())
       if (or.ok) setOuraStatus(await or.json())
+      if (fr.ok) setFitbitStatus(await fr.json())
+      if (sr.ok) setStravaStatus(await sr.json())
     } catch { /* ignore */ }
   }, [])
 
@@ -85,18 +98,13 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
     const BACKEND_ORIGIN = `${window.location.protocol}//${window.location.hostname}:8000`
     function handleMessage(e: MessageEvent) {
       if (e.origin !== window.location.origin && e.origin !== BACKEND_ORIGIN) return
-      if (!e.data) return
-      if (e.data.type === 'whoop_oauth') {
+      if (!e.data?.type) return
+      const provider = e.data.type.replace('_oauth', '') as string
+      if (['whoop', 'oura', 'fitbit', 'strava'].includes(provider)) {
         if (e.data.status === 'success') {
-          showToast('WHOOP connected ✓')
-          fetchStatuses().then(() => handleWhoopSync())
-        } else showToast('WHOOP connection failed')
-      }
-      if (e.data.type === 'oura_oauth') {
-        if (e.data.status === 'success') {
-          showToast('Oura connected ✓')
-          fetchStatuses().then(() => handleOuraSync())
-        } else showToast('Oura connection failed')
+          showToast(`${PROVIDER_LABELS[provider]} connected ✓`)
+          fetchStatuses().then(() => handleSync(provider))
+        } else showToast(`${PROVIDER_LABELS[provider]} connection failed`)
       }
     }
     window.addEventListener('message', handleMessage)
@@ -111,25 +119,20 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
     window.open(url, '_blank', `width=${w},height=${h},left=${left},top=${top},toolbar=no,menubar=no`)
   }
 
-  async function handleWhoopConnect() {
+  const PROVIDER_LABELS: Record<string, string> = {
+    whoop: 'WHOOP', oura: 'Oura', fitbit: 'Fitbit', strava: 'Strava',
+  }
+
+  async function handleOAuthConnect(provider: string) {
     try {
-      const res  = await apiFetch('/api/whoop/connect')
+      const res  = await apiFetch(`/api/${provider}/connect`)
       const data = await res.json()
-      if (!res.ok || !data.auth_url) { showToast(data.error || 'Failed to start WHOOP auth'); return }
+      if (!res.ok || !data.auth_url) { showToast(data.error || `Failed to start ${PROVIDER_LABELS[provider]} auth`); return }
       openOAuthPopup(data.auth_url)
     } catch { showToast('Could not reach server') }
   }
 
-  async function handleOuraConnect() {
-    try {
-      const res  = await apiFetch('/api/oura/connect')
-      const data = await res.json()
-      if (!res.ok || !data.auth_url) { showToast(data.error || 'Failed to start Oura auth'); return }
-      openOAuthPopup(data.auth_url)
-    } catch { showToast('Could not reach server') }
-  }
-
-  async function handlePatSave(provider: 'whoop' | 'oura') {
+  async function handlePatSave(provider: string) {
     const token = patToken.trim()
     if (!token) return
     setPatSaving(true)
@@ -139,10 +142,10 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
         body: JSON.stringify({ token }),
       })
       if (res.ok) {
-        showToast(`${provider === 'whoop' ? 'WHOOP' : 'Oura'} connected ✓`)
+        showToast(`${PROVIDER_LABELS[provider]} connected ✓`)
         setPatOpen(null)
         setPatToken('')
-        fetchStatuses().then(() => provider === 'whoop' ? handleWhoopSync() : handleOuraSync())
+        fetchStatuses().then(() => handleSync(provider))
       } else {
         const d = await res.json()
         showToast(d.error || 'Failed to save token')
@@ -152,78 +155,86 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
   }
 
   // ── Sync helpers ────────────────────────────────────────────────────────
-  async function applySync(data: any, source: string) {
-    setState(prev => {
-      const r    = data.recovery   || {}
-      const hist = data.hrv_history || prev.recovery.hrvHistory
-      return {
+  function applySync(data: any, provider: string) {
+    if (provider === 'strava') {
+      // Strava provides activity data, not recovery metrics
+      showToast('Strava synced ✓')
+      setStravaStatus(s => s ? { ...s, last_synced: data.last_synced } : s)
+      return
+    }
+    setState(prev => ({
+      ...prev,
+      recovery: {
+        ...prev.recovery,
+        hrv:        data.recovery?.hrv   ?? prev.recovery.hrv,
+        rhr:        data.recovery?.rhr   ?? prev.recovery.rhr,
+        score:      data.recovery?.score ?? prev.recovery.score,
+        sleep:      data.sleep_hours     ?? prev.recovery.sleep,
+        hrvHistory: data.hrv_history     ?? prev.recovery.hrvHistory,
+      },
+    }))
+    showToast(`${PROVIDER_LABELS[provider]} synced ✓`)
+    if (provider === 'whoop')  setWhoopStatus(s => s ? { ...s, last_synced: data.last_synced } : s)
+    if (provider === 'oura')   setOuraStatus(s => s ? { ...s, last_synced: data.last_synced } : s)
+    if (provider === 'fitbit') setFitbitStatus(s => s ? { ...s, last_synced: data.last_synced } : s)
+  }
+
+  async function handleSync(provider: string) {
+    setSyncing(provider as any)
+    try {
+      const res  = await apiFetch(`/api/${provider}/sync`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) showToast(data.error || `${PROVIDER_LABELS[provider]} sync failed`)
+      else applySync(data, provider)
+    } catch { showToast('Sync error') }
+    setSyncing(null)
+  }
+
+  async function handleAppleHealthSync() {
+    setAhSyncing(true)
+    try {
+      const granted = await requestAppleHealthPermission()
+      if (!granted) { showToast('HealthKit permission denied'); setAhSyncing(false); return }
+      const data = await readAppleHealth()
+      if (!data) { showToast('Could not read Apple Health data'); setAhSyncing(false); return }
+      setAhConnected(true)
+      setState(prev => ({
         ...prev,
         recovery: {
           ...prev.recovery,
-          hrv:        r.hrv   ?? prev.recovery.hrv,
-          rhr:        r.rhr   ?? prev.recovery.rhr,
-          score:      r.score ?? prev.recovery.score,
+          hrv:        data.hrv        ?? prev.recovery.hrv,
+          rhr:        data.rhr        ?? prev.recovery.rhr,
           sleep:      data.sleep_hours ?? prev.recovery.sleep,
-          hrvHistory: hist,
+          hrvHistory: data.hrv_history ?? prev.recovery.hrvHistory,
         },
-      }
-    })
-    showToast(`${source} synced ✓`)
+      }))
+      showToast('Apple Health synced ✓')
+    } catch { showToast('Apple Health sync error') }
+    setAhSyncing(false)
   }
 
-  async function handleWhoopSync() {
-    setWhoopSyncing(true)
-    try {
-      const res  = await apiFetch('/api/whoop/sync', { method: 'POST' })
-      const data = await res.json()
-      if (!res.ok) { showToast(data.error || 'WHOOP sync failed') }
-      else {
-        await applySync(data, 'WHOOP')
-        setWhoopStatus(s => s ? { ...s, last_synced: data.last_synced } : s)
-      }
-    } catch { showToast('Sync error') }
-    setWhoopSyncing(false)
-  }
-
-  async function handleOuraSync() {
-    setOuraSyncing(true)
-    try {
-      const res  = await apiFetch('/api/oura/sync', { method: 'POST' })
-      const data = await res.json()
-      if (!res.ok) { showToast(data.error || 'Oura sync failed') }
-      else {
-        await applySync(data, 'Oura')
-        setOuraStatus(s => s ? { ...s, last_synced: data.last_synced } : s)
-      }
-    } catch { showToast('Sync error') }
-    setOuraSyncing(false)
-  }
-
-  async function handleWhoopDisconnect() {
-    await apiFetch('/api/whoop/disconnect', { method: 'POST' })
-    setWhoopStatus(s => s ? { ...s, connected: false, last_synced: null } : s)
-    showToast('WHOOP disconnected')
-  }
-
-  async function handleOuraDisconnect() {
-    await apiFetch('/api/oura/disconnect', { method: 'POST' })
-    setOuraStatus(s => s ? { ...s, connected: false, last_synced: null } : s)
-    showToast('Oura disconnected')
+  async function handleDisconnect(provider: string) {
+    await apiFetch(`/api/${provider}/disconnect`, { method: 'POST' })
+    const update = (s: any) => s ? { ...s, connected: false, last_synced: null } : s
+    if (provider === 'whoop')  setWhoopStatus(update)
+    if (provider === 'oura')   setOuraStatus(update)
+    if (provider === 'fitbit') setFitbitStatus(update)
+    if (provider === 'strava') setStravaStatus(update)
+    showToast(`${PROVIDER_LABELS[provider]} disconnected`)
   }
 
   // ── Wearable row renderer ───────────────────────────────────────────────
   function WearableRow({
-    icon, name, color,
-    configured, connected, syncing, lastSync,
-    setupKey, patUrl,
-    onConnect, onSync, onDisconnect,
+    icon, name, color, provider,
+    configured, connected, lastSync,
+    patUrl, hasPat = true, subtitle,
   }: {
-    icon: string; name: string; color: string
-    configured: boolean; connected: boolean; syncing: boolean; lastSync: string | null
-    setupKey: 'whoop' | 'oura'; patUrl: string
-    onConnect: () => void; onSync: () => void; onDisconnect: () => void
+    icon: string; name: string; color: string; provider: string
+    configured: boolean; connected: boolean; lastSync: string | null
+    patUrl?: string; hasPat?: boolean; subtitle?: string
   }) {
-    const isPatOpen = patOpen === setupKey
+    const isPatOpen  = patOpen === provider
+    const isSyncing  = syncing === provider
     return (
       <div style={{ borderBottom: '1px solid var(--ash3)', paddingBottom: 14, marginBottom: 14 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -238,36 +249,45 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
               <div style={{ fontSize: 11, color: connected ? 'var(--green)' : 'var(--ash)' }}>
                 {connected
                   ? lastSync ? `Synced ${fmt_time(lastSync)}` : 'Connected — tap Sync'
-                  : 'Not connected'}
+                  : subtitle || 'Not connected'}
               </div>
             </div>
           </div>
           {connected ? (
             <div style={{ display: 'flex', gap: 6 }}>
-              <button onClick={onSync} disabled={syncing} style={btnStyle('var(--ink)', 'var(--linen)')}>
-                {syncing ? '…' : '↻ Sync'}
+              <button onClick={() => handleSync(provider)} disabled={isSyncing}
+                style={btnStyle('var(--ink)', 'var(--linen)')}>
+                {isSyncing ? '…' : '↻ Sync'}
               </button>
-              <button onClick={onDisconnect} style={btnStyle('transparent', 'var(--ash)', '1px solid var(--ash3)')}>
+              <button onClick={() => handleDisconnect(provider)}
+                style={btnStyle('transparent', 'var(--ash)', '1px solid var(--ash3)')}>
                 ✕
               </button>
             </div>
           ) : (
             <div style={{ display: 'flex', gap: 6 }}>
-              <button
-                onClick={() => { setPatOpen(isPatOpen ? null : setupKey); setPatToken('') }}
-                style={btnStyle('transparent', 'var(--copper)', '1px solid rgba(184,134,78,.3)')}
-              >
-                {isPatOpen ? 'Cancel' : 'Connect ↗'}
-              </button>
-              {configured && (
-                <button onClick={onConnect} style={btnStyle('var(--ink)', 'var(--linen)')}>OAuth</button>
+              {hasPat && (
+                <button
+                  onClick={() => { setPatOpen(isPatOpen ? null : provider as any); setPatToken('') }}
+                  style={btnStyle('transparent', 'var(--copper)', '1px solid rgba(184,134,78,.3)')}
+                >
+                  {isPatOpen ? 'Cancel' : 'Connect ↗'}
+                </button>
+              )}
+              {configured && !hasPat && (
+                <button onClick={() => handleOAuthConnect(provider)}
+                  style={btnStyle('var(--ink)', 'var(--linen)')}>Connect ↗</button>
+              )}
+              {configured && hasPat && (
+                <button onClick={() => handleOAuthConnect(provider)}
+                  style={btnStyle('var(--ink)', 'var(--linen)')}>OAuth</button>
               )}
             </div>
           )}
         </div>
 
         {/* ── PAT inline form ── */}
-        {!connected && isPatOpen && (
+        {!connected && isPatOpen && patUrl && (
           <div style={{
             marginTop: 10,
             background: 'rgba(184,134,78,.05)',
@@ -288,7 +308,7 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
                 placeholder="Paste token here…"
                 value={patToken}
                 onChange={e => setPatToken(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') handlePatSave(setupKey) }}
+                onKeyDown={e => { if (e.key === 'Enter') handlePatSave(provider) }}
                 style={{
                   flex: 1, background: 'var(--white)', border: '1px solid var(--ash3)',
                   borderRadius: 10, padding: '8px 12px', fontSize: 12,
@@ -296,7 +316,7 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
                 }}
               />
               <button
-                onClick={() => handlePatSave(setupKey)}
+                onClick={() => handlePatSave(provider)}
                 disabled={patSaving || !patToken.trim()}
                 style={btnStyle('var(--copper)', 'var(--linen)')}
               >
@@ -322,29 +342,63 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
       <div style={{ padding: '0 20px', marginBottom: 20 }}>
         <div style={{ background: 'var(--white)', border: '1px solid var(--ash3)', borderRadius: 20, padding: '16px 16px 0' }}>
           <WearableRow
-            icon="⌚" name="WHOOP" color="rgba(58,122,92)"
+            icon="⌚" name="WHOOP" color="rgba(58,122,92)" provider="whoop"
             configured={whoopStatus?.configured ?? false}
             connected={whoopStatus?.connected ?? false}
-            syncing={whoopSyncing}
             lastSync={whoopStatus?.last_synced ?? null}
             patUrl="https://developer.whoop.com"
-            setupKey="whoop"
-            onConnect={handleWhoopConnect}
-            onSync={handleWhoopSync}
-            onDisconnect={handleWhoopDisconnect}
           />
           <WearableRow
-            icon="💍" name="Oura Ring" color="rgba(46,95,138)"
+            icon="💍" name="Oura Ring" color="rgba(46,95,138)" provider="oura"
             configured={ouraStatus?.configured ?? false}
             connected={ouraStatus?.connected ?? false}
-            syncing={ouraSyncing}
             lastSync={ouraStatus?.last_synced ?? null}
             patUrl="https://cloud.ouraring.com/personal-access-tokens"
-            setupKey="oura"
-            onConnect={handleOuraConnect}
-            onSync={handleOuraSync}
-            onDisconnect={handleOuraDisconnect}
           />
+          <WearableRow
+            icon="📊" name="Fitbit" color="rgba(0,178,227)" provider="fitbit"
+            configured={fitbitStatus?.configured ?? false}
+            connected={fitbitStatus?.connected ?? false}
+            lastSync={fitbitStatus?.last_synced ?? null}
+            patUrl="https://dev.fitbit.com/apps"
+            subtitle="Sleep · HRV · RHR"
+          />
+          <WearableRow
+            icon="🚴" name="Strava" color="rgba(252,76,2)" provider="strava"
+            configured={stravaStatus?.configured ?? false}
+            connected={stravaStatus?.connected ?? false}
+            lastSync={stravaStatus?.last_synced ?? null}
+            hasPat={false}
+            subtitle="Activities · Training load"
+          />
+
+          {/* Apple Health — iOS native only */}
+          {isNative && (
+            <div style={{ borderBottom: '1px solid var(--ash3)', paddingBottom: 14, marginBottom: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <div style={{
+                    width: 34, height: 34, borderRadius: 10,
+                    background: ahConnected ? 'rgba(252,37,107,.1)' : 'var(--ash3)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16,
+                  }}>❤️</div>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)' }}>Apple Health</div>
+                    <div style={{ fontSize: 11, color: ahConnected ? 'var(--green)' : 'var(--ash)' }}>
+                      {ahConnected ? 'HRV · RHR · Sleep' : 'Tap to read from HealthKit'}
+                    </div>
+                  </div>
+                </div>
+                <button
+                  onClick={handleAppleHealthSync}
+                  disabled={ahSyncing}
+                  style={btnStyle('var(--ink)', 'var(--linen)')}
+                >
+                  {ahSyncing ? '…' : ahConnected ? '↻ Sync' : 'Connect ↗'}
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Manual entry row */}
           <div style={{ paddingBottom: 14, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
