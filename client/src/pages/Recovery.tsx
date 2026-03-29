@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useApp } from '../context/AppContext'
+import { apiFetch } from '../lib/api'
 import type { WhoopStatus } from '../types'
 
 interface OuraStatus {
@@ -46,7 +47,9 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
   const [ouraStatus,  setOuraStatus]  = useState<OuraStatus  | null>(null)
   const [whoopSyncing, setWhoopSyncing] = useState(false)
   const [ouraSyncing,  setOuraSyncing]  = useState(false)
-  const [setupOpen, setSetupOpen] = useState<'whoop' | 'oura' | null>(null)
+  const [patOpen, setPatOpen] = useState<'whoop' | 'oura' | null>(null)
+  const [patToken, setPatToken] = useState('')
+  const [patSaving, setPatSaving] = useState(false)
 
   const DAYS   = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
   const maxHrv = Math.max(...hrvHistory, 1)
@@ -66,8 +69,8 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
   const fetchStatuses = useCallback(async () => {
     try {
       const [wr, or] = await Promise.all([
-        fetch('/api/whoop/status', { credentials: 'include' }),
-        fetch('/api/oura/status',  { credentials: 'include' }),
+        apiFetch('/api/whoop/status'),
+        apiFetch('/api/oura/status'),
       ])
       if (wr.ok) setWhoopStatus(await wr.json())
       if (or.ok) setOuraStatus(await or.json())
@@ -110,7 +113,7 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
 
   async function handleWhoopConnect() {
     try {
-      const res  = await fetch('/api/whoop/connect', { credentials: 'include' })
+      const res  = await apiFetch('/api/whoop/connect')
       const data = await res.json()
       if (!res.ok || !data.auth_url) { showToast(data.error || 'Failed to start WHOOP auth'); return }
       openOAuthPopup(data.auth_url)
@@ -119,11 +122,33 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
 
   async function handleOuraConnect() {
     try {
-      const res  = await fetch('/api/oura/connect', { credentials: 'include' })
+      const res  = await apiFetch('/api/oura/connect')
       const data = await res.json()
       if (!res.ok || !data.auth_url) { showToast(data.error || 'Failed to start Oura auth'); return }
       openOAuthPopup(data.auth_url)
     } catch { showToast('Could not reach server') }
+  }
+
+  async function handlePatSave(provider: 'whoop' | 'oura') {
+    const token = patToken.trim()
+    if (!token) return
+    setPatSaving(true)
+    try {
+      const res = await apiFetch(`/api/${provider}/pat`, {
+        method: 'POST',
+        body: JSON.stringify({ token }),
+      })
+      if (res.ok) {
+        showToast(`${provider === 'whoop' ? 'WHOOP' : 'Oura'} connected ✓`)
+        setPatOpen(null)
+        setPatToken('')
+        fetchStatuses().then(() => provider === 'whoop' ? handleWhoopSync() : handleOuraSync())
+      } else {
+        const d = await res.json()
+        showToast(d.error || 'Failed to save token')
+      }
+    } catch { showToast('Could not reach server') }
+    setPatSaving(false)
   }
 
   // ── Sync helpers ────────────────────────────────────────────────────────
@@ -149,7 +174,7 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
   async function handleWhoopSync() {
     setWhoopSyncing(true)
     try {
-      const res  = await fetch('/api/whoop/sync', { method: 'POST', credentials: 'include' })
+      const res  = await apiFetch('/api/whoop/sync', { method: 'POST' })
       const data = await res.json()
       if (!res.ok) { showToast(data.error || 'WHOOP sync failed') }
       else {
@@ -163,7 +188,7 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
   async function handleOuraSync() {
     setOuraSyncing(true)
     try {
-      const res  = await fetch('/api/oura/sync', { method: 'POST', credentials: 'include' })
+      const res  = await apiFetch('/api/oura/sync', { method: 'POST' })
       const data = await res.json()
       if (!res.ok) { showToast(data.error || 'Oura sync failed') }
       else {
@@ -175,13 +200,13 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
   }
 
   async function handleWhoopDisconnect() {
-    await fetch('/api/whoop/disconnect', { method: 'POST', credentials: 'include' })
+    await apiFetch('/api/whoop/disconnect', { method: 'POST' })
     setWhoopStatus(s => s ? { ...s, connected: false, last_synced: null } : s)
     showToast('WHOOP disconnected')
   }
 
   async function handleOuraDisconnect() {
-    await fetch('/api/oura/disconnect', { method: 'POST', credentials: 'include' })
+    await apiFetch('/api/oura/disconnect', { method: 'POST' })
     setOuraStatus(s => s ? { ...s, connected: false, last_synced: null } : s)
     showToast('Oura disconnected')
   }
@@ -190,15 +215,15 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
   function WearableRow({
     icon, name, color,
     configured, connected, syncing, lastSync,
-    redirectUri, setupKey,
+    setupKey, patUrl,
     onConnect, onSync, onDisconnect,
   }: {
     icon: string; name: string; color: string
     configured: boolean; connected: boolean; syncing: boolean; lastSync: string | null
-    redirectUri: string; setupKey: 'whoop' | 'oura'
+    setupKey: 'whoop' | 'oura'; patUrl: string
     onConnect: () => void; onSync: () => void; onDisconnect: () => void
   }) {
-    const isSetupOpen = setupOpen === setupKey
+    const isPatOpen = patOpen === setupKey
     return (
       <div style={{ borderBottom: '1px solid var(--ash3)', paddingBottom: 14, marginBottom: 14 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -212,8 +237,8 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
               <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)' }}>{name}</div>
               <div style={{ fontSize: 11, color: connected ? 'var(--green)' : 'var(--ash)' }}>
                 {connected
-                  ? lastSync ? `Synced at ${fmt_time(lastSync)}` : 'Connected — tap Sync'
-                  : configured ? 'Not connected' : 'Setup required'}
+                  ? lastSync ? `Synced ${fmt_time(lastSync)}` : 'Connected — tap Sync'
+                  : 'Not connected'}
               </div>
             </div>
           </div>
@@ -226,41 +251,58 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
                 ✕
               </button>
             </div>
-          ) : configured ? (
-            <button onClick={onConnect} style={btnStyle('var(--ink)', 'var(--linen)')}>Connect ↗</button>
           ) : (
-            <button onClick={() => setSetupOpen(isSetupOpen ? null : setupKey)}
-              style={btnStyle('transparent', 'var(--copper)', '1px solid rgba(184,134,78,.3)')}>
-              Setup {isSetupOpen ? '↑' : '↓'}
-            </button>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button
+                onClick={() => { setPatOpen(isPatOpen ? null : setupKey); setPatToken('') }}
+                style={btnStyle('transparent', 'var(--copper)', '1px solid rgba(184,134,78,.3)')}
+              >
+                {isPatOpen ? 'Cancel' : 'Connect ↗'}
+              </button>
+              {configured && (
+                <button onClick={onConnect} style={btnStyle('var(--ink)', 'var(--linen)')}>OAuth</button>
+              )}
+            </div>
           )}
         </div>
-        {!configured && isSetupOpen && (
+
+        {/* ── PAT inline form ── */}
+        {!connected && isPatOpen && (
           <div style={{
             marginTop: 10,
-            background: 'rgba(184,134,78,.06)',
-            border: '1px solid rgba(184,134,78,.2)',
-            borderRadius: 12, padding: '12px 14px',
-            fontSize: 12, color: 'var(--ink2)', lineHeight: 1.7,
+            background: 'rgba(184,134,78,.05)',
+            border: '1px solid rgba(184,134,78,.18)',
+            borderRadius: 12, padding: '14px',
           }}>
-            <div style={{ fontWeight: 700, color: 'var(--copper)', fontSize: 10, letterSpacing: 1, textTransform: 'uppercase', marginBottom: 6 }}>
-              How to connect {name}
+            <div style={{ fontSize: 11, color: 'var(--ash)', marginBottom: 10, lineHeight: 1.6 }}>
+              Generate a free Personal Access Token at{' '}
+              <a href={patUrl} target="_blank" rel="noopener noreferrer"
+                style={{ color: 'var(--copper)', textDecoration: 'none', fontWeight: 600 }}>
+                {patUrl.replace('https://', '')}
+              </a>
+              {' '}— no app approval needed.
             </div>
-            {setupKey === 'whoop' ? (
-              <ol style={{ margin: 0, paddingLeft: 16, display: 'flex', flexDirection: 'column', gap: 3 }}>
-                <li>Go to <strong>developer.whoop.com</strong> → create a developer app</li>
-                <li>Add this redirect URI: <code style={codeStyle}>{redirectUri}</code></li>
-                <li>Copy Client ID + Secret → add as secrets <code>WHOOP_CLIENT_ID</code> and <code>WHOOP_CLIENT_SECRET</code></li>
-                <li>Restart the server</li>
-              </ol>
-            ) : (
-              <ol style={{ margin: 0, paddingLeft: 16, display: 'flex', flexDirection: 'column', gap: 3 }}>
-                <li>Go to <strong>cloud.ouraring.com/oauth/applications</strong> → create a new application</li>
-                <li>Add this redirect URI: <code style={codeStyle}>{redirectUri}</code></li>
-                <li>Copy Client ID + Secret → add as secrets <code>OURA_CLIENT_ID</code> and <code>OURA_CLIENT_SECRET</code></li>
-                <li>Restart the server — the Connect button will appear</li>
-              </ol>
-            )}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input
+                type="password"
+                placeholder="Paste token here…"
+                value={patToken}
+                onChange={e => setPatToken(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handlePatSave(setupKey) }}
+                style={{
+                  flex: 1, background: 'var(--white)', border: '1px solid var(--ash3)',
+                  borderRadius: 10, padding: '8px 12px', fontSize: 12,
+                  color: 'var(--ink)', outline: 'none',
+                }}
+              />
+              <button
+                onClick={() => handlePatSave(setupKey)}
+                disabled={patSaving || !patToken.trim()}
+                style={btnStyle('var(--copper)', 'var(--linen)')}
+              >
+                {patSaving ? '…' : 'Save'}
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -285,7 +327,7 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
             connected={whoopStatus?.connected ?? false}
             syncing={whoopSyncing}
             lastSync={whoopStatus?.last_synced ?? null}
-            redirectUri={whoopStatus?.redirect_uri ?? ''}
+            patUrl="https://developer.whoop.com"
             setupKey="whoop"
             onConnect={handleWhoopConnect}
             onSync={handleWhoopSync}
@@ -297,7 +339,7 @@ export default function Recovery({ showToast, onLogMetrics }: Props) {
             connected={ouraStatus?.connected ?? false}
             syncing={ouraSyncing}
             lastSync={ouraStatus?.last_synced ?? null}
-            redirectUri={ouraStatus?.redirect_uri ?? ''}
+            patUrl="https://cloud.ouraring.com/personal-access-tokens"
             setupKey="oura"
             onConnect={handleOuraConnect}
             onSync={handleOuraSync}
@@ -411,10 +453,3 @@ function btnStyle(bg: string, color: string, border = 'none'): React.CSSProperti
   }
 }
 
-const codeStyle: React.CSSProperties = {
-  display: 'block', marginTop: 4,
-  background: 'var(--ash3)', borderRadius: 8,
-  padding: '5px 9px', fontSize: 10,
-  fontFamily: 'monospace', wordBreak: 'break-all',
-  color: 'var(--ink)',
-}

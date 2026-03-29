@@ -578,6 +578,23 @@ def whoop_status():
     })
 
 
+@app.route("/api/whoop/pat", methods=["POST"])
+@_require_auth
+@limiter.limit("10 per minute")
+def whoop_pat():
+    """Accept a WHOOP Personal Access Token and store it directly — no OAuth needed."""
+    data = request.get_json(silent=True) or {}
+    pat  = str(data.get("token", "")).strip()
+    if not pat:
+        return jsonify({"error": "token required"}), 400
+    _set_tok(g.user_id, "whoop", {
+        "access_token":  pat,
+        "refresh_token": None,
+        "expires_at":    9_999_999_999.0,   # PATs don't auto-expire
+    })
+    return jsonify({"ok": True})
+
+
 @app.route("/api/whoop/connect")
 @_require_auth
 @limiter.limit("10 per minute")
@@ -745,6 +762,23 @@ def oura_status():
         "redirect_uri": OURA_REDIRECT_URI,
         "last_synced": tok.get("last_synced"),
     })
+
+
+@app.route("/api/oura/pat", methods=["POST"])
+@_require_auth
+@limiter.limit("10 per minute")
+def oura_pat():
+    """Accept an Oura Personal Access Token and store it directly — no OAuth needed."""
+    data = request.get_json(silent=True) or {}
+    pat  = str(data.get("token", "")).strip()
+    if not pat:
+        return jsonify({"error": "token required"}), 400
+    _set_tok(g.user_id, "oura", {
+        "access_token":  pat,
+        "refresh_token": None,
+        "expires_at":    9_999_999_999.0,
+    })
+    return jsonify({"ok": True})
 
 
 @app.route("/api/oura/connect")
