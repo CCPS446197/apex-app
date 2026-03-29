@@ -6,3 +6,4 @@ apex.db
 client/node_modules/
 client/dist/
 client/.env.local
+supabase/.temp/
