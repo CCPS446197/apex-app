@@ -16,7 +16,6 @@ import logging
 import os
 import re
 import secrets
-import sqlite3
 import time
 from datetime import datetime, timedelta
 from functools import wraps
@@ -26,7 +25,7 @@ import anthropic
 import jwt as _jwt
 import requests as http
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, session, send_from_directory, Response, stream_with_context
+from flask import Flask, g, jsonify, request, session, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -87,6 +86,9 @@ ai_client = anthropic.Anthropic(
 INTERNAL_SECRET     = os.environ.get("APEX_INTERNAL_SECRET", "")
 # Supabase JWT secret — used to verify user Bearer tokens
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+# Supabase project credentials — used by the backend to read/write wearable_tokens
+SUPABASE_URL         = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 # Slack/Discord/PagerDuty webhook for error alerts (optional)
 ALERT_WEBHOOK       = os.environ.get("ALERT_WEBHOOK_URL", "")
 
@@ -116,11 +118,14 @@ def _send_alert(message: str, dedup_key: str | None = None) -> None:
 
 def _require_auth(fn):
     """Validate Supabase JWT from Authorization: Bearer <token>.
-    If SUPABASE_JWT_SECRET is not configured (local dev), passes through with a warning."""
+    Stores the user's UUID in flask.g.user_id for downstream use.
+    If SUPABASE_JWT_SECRET is not configured (local dev), passes through with
+    a synthetic dev user_id so wearable routes still work against Supabase."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if not SUPABASE_JWT_SECRET:
             log.warning("auth_bypass path=%s reason=no_jwt_secret_configured", request.path)
+            g.user_id = "00000000-0000-0000-0000-000000000001"  # stable dev UUID
             return fn(*args, **kwargs)
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
@@ -128,8 +133,9 @@ def _require_auth(fn):
             return jsonify({"error": "Unauthorized"}), 401
         token = auth[7:]
         try:
-            _jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"],
-                        options={"verify_aud": False})
+            payload = _jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"],
+                                  options={"verify_aud": False})
+            g.user_id = payload["sub"]  # Supabase sets sub = user UUID
         except _jwt.ExpiredSignatureError:
             log.warning("auth_rejected path=%s reason=token_expired", request.path)
             return jsonify({"error": "Token expired — please log in again"}), 401
@@ -225,66 +231,76 @@ _HOST             = os.environ.get("API_HOST", "http://localhost:8000")
 WHOOP_REDIRECT_URI = os.environ.get("WHOOP_REDIRECT_URI", f"{_HOST}/api/whoop/callback")
 OURA_REDIRECT_URI  = os.environ.get("OURA_REDIRECT_URI",  f"{_HOST}/api/oura/callback")
 
-# ── SQLite token store ────────────────────────────────────────────────────────
+# ── Supabase token store (per-user) ───────────────────────────────────────────
+# All wearable OAuth tokens are stored in the `wearable_tokens` table in Supabase,
+# scoped to the authenticated user's UUID.  The backend uses the service-role key
+# so RLS does not apply here — be careful never to expose it client-side.
 
-DB_PATH = os.environ.get("DB_PATH", "apex.db")
-
-
-def _db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _init_db():
-    with _db() as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS tokens (
-                key          TEXT PRIMARY KEY,
-                access_token  TEXT NOT NULL,
-                refresh_token TEXT,
-                expires_at    REAL,
-                last_synced   TEXT
-            )
-        """)
-        # key is already indexed as PRIMARY KEY, but explicit for clarity
-        c.execute("CREATE INDEX IF NOT EXISTS idx_tokens_key ON tokens(key)")
-        c.commit()
+def _supa_headers() -> dict:
+    return {
+        "apikey":        SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type":  "application/json",
+    }
 
 
-_init_db()
+def _get_tok(user_id: str, provider: str) -> dict:
+    """Return the stored token dict for (user_id, provider), or {} if none."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        log.warning("token_store_unavailable reason=missing_supabase_credentials")
+        return {}
+    r = http.get(
+        f"{SUPABASE_URL}/rest/v1/wearable_tokens",
+        params={"user_id": f"eq.{user_id}", "provider": f"eq.{provider}", "limit": "1"},
+        headers=_supa_headers(),
+        timeout=5,
+    )
+    rows = r.json() if r.ok else []
+    return rows[0] if rows else {}
 
 
-def _get_tok(key: str) -> dict:
-    with _db() as c:
-        row = c.execute("SELECT * FROM tokens WHERE key = ?", (key,)).fetchone()
-        return dict(row) if row else {}
+def _set_tok(user_id: str, provider: str, data: dict):
+    """Upsert the token row for (user_id, provider)."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+    payload = {
+        "user_id":       user_id,
+        "provider":      provider,
+        "access_token":  data.get("access_token"),
+        "refresh_token": data.get("refresh_token"),
+        "expires_at":    data.get("expires_at"),
+        "last_synced":   data.get("last_synced"),
+    }
+    http.post(
+        f"{SUPABASE_URL}/rest/v1/wearable_tokens",
+        json=payload,
+        headers={**_supa_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+        timeout=5,
+    )
 
 
-def _set_tok(key: str, data: dict):
-    with _db() as c:
-        c.execute("""
-            INSERT INTO tokens (key, access_token, refresh_token, expires_at, last_synced)
-            VALUES (:key, :access_token, :refresh_token, :expires_at, :last_synced)
-            ON CONFLICT(key) DO UPDATE SET
-                access_token  = excluded.access_token,
-                refresh_token = COALESCE(excluded.refresh_token, refresh_token),
-                expires_at    = COALESCE(excluded.expires_at,    expires_at),
-                last_synced   = COALESCE(excluded.last_synced,   last_synced)
-        """, {
-            "key":           key,
-            "access_token":  data.get("access_token"),
-            "refresh_token": data.get("refresh_token"),
-            "expires_at":    data.get("expires_at"),
-            "last_synced":   data.get("last_synced"),
-        })
-        c.commit()
+def _del_tok(user_id: str, provider: str):
+    """Delete the token row for (user_id, provider)."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+    http.delete(
+        f"{SUPABASE_URL}/rest/v1/wearable_tokens",
+        params={"user_id": f"eq.{user_id}", "provider": f"eq.{provider}"},
+        headers=_supa_headers(),
+        timeout=5,
+    )
 
 
-def _del_tok(key: str):
-    with _db() as c:
-        c.execute("DELETE FROM tokens WHERE key = ?", (key,))
-        c.commit()
+def _list_all_toks() -> list[dict]:
+    """Return every row in wearable_tokens (used by the cron sync-all job)."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return []
+    r = http.get(
+        f"{SUPABASE_URL}/rest/v1/wearable_tokens",
+        headers=_supa_headers(),
+        timeout=10,
+    )
+    return r.json() if r.ok else []
 
 
 # ── Claude system prompts ─────────────────────────────────────────────────────
@@ -509,9 +525,9 @@ def scan():
 
 # ── WHOOP helpers ─────────────────────────────────────────────────────────────
 
-def _whoop_ensure_token() -> str | None:
-    """Return a valid WHOOP access token, refreshing if needed."""
-    tok = _get_tok("whoop")
+def _whoop_ensure_token(user_id: str) -> str | None:
+    """Return a valid WHOOP access token for user_id, refreshing if needed."""
+    tok = _get_tok(user_id, "whoop")
     if not tok.get("access_token"):
         return None
     expires_at = tok.get("expires_at", 0) or 0
@@ -527,7 +543,7 @@ def _whoop_ensure_token() -> str | None:
     if not resp.ok:
         return None
     new = resp.json()
-    _set_tok("whoop", {
+    _set_tok(user_id, "whoop", {
         "access_token":  new["access_token"],
         "refresh_token": new.get("refresh_token", tok.get("refresh_token")),
         "expires_at":    datetime.utcnow().timestamp() + new.get("expires_in", 3600),
@@ -536,8 +552,8 @@ def _whoop_ensure_token() -> str | None:
     return new["access_token"]
 
 
-def _whoop_get(path: str):
-    token = _whoop_ensure_token()
+def _whoop_get(user_id: str, path: str):
+    token = _whoop_ensure_token(user_id)
     if not token:
         return None, "Not connected"
     resp = http.get(f"{WHOOP_API_BASE}{path}",
@@ -550,9 +566,10 @@ def _whoop_get(path: str):
 # ── WHOOP routes ──────────────────────────────────────────────────────────────
 
 @app.route("/api/whoop/status")
+@_require_auth
 @limiter.limit("30 per minute")
 def whoop_status():
-    tok = _get_tok("whoop")
+    tok = _get_tok(g.user_id, "whoop")
     return jsonify({
         "configured":  bool(WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET),
         "connected":   bool(tok.get("access_token")),
@@ -562,12 +579,14 @@ def whoop_status():
 
 
 @app.route("/api/whoop/connect")
+@_require_auth
 @limiter.limit("10 per minute")
 def whoop_connect():
     if not WHOOP_CLIENT_ID:
         return jsonify({"error": "WHOOP_CLIENT_ID not configured"}), 503
     state = secrets.token_urlsafe(16)
-    session["whoop_state"] = state
+    session["whoop_state"]   = state
+    session["whoop_user_id"] = g.user_id   # stored so callback can scope the token
     auth_url = WHOOP_AUTH_URL + "?" + urlencode({
         "client_id":     WHOOP_CLIENT_ID,
         "redirect_uri":  WHOOP_REDIRECT_URI,
@@ -588,6 +607,9 @@ def whoop_callback():
         return _popup_page("whoop_oauth", "error", error or "No code received")
     if state != session.get("whoop_state"):
         return _popup_page("whoop_oauth", "error", "State mismatch — possible CSRF")
+    user_id = session.get("whoop_user_id")
+    if not user_id:
+        return _popup_page("whoop_oauth", "error", "Session expired — please try again")
 
     resp = http.post(WHOOP_TOKEN_URL, data={
         "grant_type":    "authorization_code",
@@ -601,25 +623,28 @@ def whoop_callback():
         return _popup_page("whoop_oauth", "error", f"Token exchange failed: {resp.text}")
 
     tok = resp.json()
-    _set_tok("whoop", {
+    _set_tok(user_id, "whoop", {
         "access_token":  tok["access_token"],
         "refresh_token": tok.get("refresh_token", ""),
         "expires_at":    datetime.utcnow().timestamp() + tok.get("expires_in", 3600),
     })
+    session.pop("whoop_state",   None)
+    session.pop("whoop_user_id", None)
     return _popup_page("whoop_oauth", "success", "")
 
 
 @app.route("/api/whoop/sync", methods=["POST"])
+@_require_auth
 @limiter.limit("10 per minute")
 def whoop_sync():
-    tok = _get_tok("whoop")
+    tok = _get_tok(g.user_id, "whoop")
     if not tok.get("access_token"):
         return jsonify({"error": "Not connected"}), 401
 
     result: dict = {}
 
     # Recovery (HRV + RHR + score)
-    rec_data, err = _whoop_get("/recovery?limit=1")
+    rec_data, err = _whoop_get(g.user_id, "/recovery?limit=1")
     if err:
         return jsonify({"error": err}), 502
     records = rec_data.get("records", [])
@@ -632,7 +657,7 @@ def whoop_sync():
         }
 
     # Sleep hours
-    sleep_data, _ = _whoop_get("/activity/sleep?limit=1")
+    sleep_data, _ = _whoop_get(g.user_id, "/activity/sleep?limit=1")
     if sleep_data:
         sleeps = sleep_data.get("records", [])
         if sleeps:
@@ -645,7 +670,7 @@ def whoop_sync():
             result["sleep_hours"] = round(total_ms / 3_600_000, 1)
 
     # 7-day HRV history
-    hrv_data, _ = _whoop_get("/recovery?limit=7")
+    hrv_data, _ = _whoop_get(g.user_id, "/recovery?limit=7")
     if hrv_data:
         hrv_vals = [
             round(r.get("score", {}).get("hrv_rmssd_milli", 0))
@@ -655,22 +680,23 @@ def whoop_sync():
             result["hrv_history"] = hrv_vals
 
     last_synced = datetime.utcnow().isoformat() + "Z"
-    _set_tok("whoop", {**tok, "last_synced": last_synced})
+    _set_tok(g.user_id, "whoop", {**tok, "last_synced": last_synced})
     result["last_synced"] = last_synced
     return jsonify(result)
 
 
 @app.route("/api/whoop/disconnect", methods=["POST"])
+@_require_auth
 @limiter.limit("10 per minute")
 def whoop_disconnect():
-    _del_tok("whoop")
+    _del_tok(g.user_id, "whoop")
     return jsonify({"ok": True})
 
 
 # ── Oura helpers ──────────────────────────────────────────────────────────────
 
-def _oura_ensure_token() -> str | None:
-    tok = _get_tok("oura")
+def _oura_ensure_token(user_id: str) -> str | None:
+    tok = _get_tok(user_id, "oura")
     if not tok.get("access_token"):
         return None
     expires_at = tok.get("expires_at", 0) or 0
@@ -685,7 +711,7 @@ def _oura_ensure_token() -> str | None:
     if not resp.ok:
         return None
     new = resp.json()
-    _set_tok("oura", {
+    _set_tok(user_id, "oura", {
         "access_token":  new["access_token"],
         "refresh_token": new.get("refresh_token", tok.get("refresh_token")),
         "expires_at":    datetime.utcnow().timestamp() + new.get("expires_in", 86400),
@@ -694,8 +720,8 @@ def _oura_ensure_token() -> str | None:
     return new["access_token"]
 
 
-def _oura_get(path: str, params: dict | None = None):
-    token = _oura_ensure_token()
+def _oura_get(user_id: str, path: str, params: dict | None = None):
+    token = _oura_ensure_token(user_id)
     if not token:
         return None, "Not connected"
     resp = http.get(f"{OURA_API_BASE}{path}",
@@ -709,9 +735,10 @@ def _oura_get(path: str, params: dict | None = None):
 # ── Oura routes ───────────────────────────────────────────────────────────────
 
 @app.route("/api/oura/status")
+@_require_auth
 @limiter.limit("30 per minute")
 def oura_status():
-    tok = _get_tok("oura")
+    tok = _get_tok(g.user_id, "oura")
     return jsonify({
         "configured":  bool(OURA_CLIENT_ID and OURA_CLIENT_SECRET),
         "connected":   bool(tok.get("access_token")),
@@ -721,12 +748,14 @@ def oura_status():
 
 
 @app.route("/api/oura/connect")
+@_require_auth
 @limiter.limit("10 per minute")
 def oura_connect():
     if not OURA_CLIENT_ID:
         return jsonify({"error": "OURA_CLIENT_ID not configured"}), 503
     state = secrets.token_urlsafe(16)
-    session["oura_state"] = state
+    session["oura_state"]   = state
+    session["oura_user_id"] = g.user_id   # stored so callback can scope the token
     auth_url = OURA_AUTH_URL + "?" + urlencode({
         "client_id":     OURA_CLIENT_ID,
         "redirect_uri":  OURA_REDIRECT_URI,
@@ -747,6 +776,9 @@ def oura_callback():
         return _popup_page("oura_oauth", "error", error or "No code received")
     if state != session.get("oura_state"):
         return _popup_page("oura_oauth", "error", "State mismatch")
+    user_id = session.get("oura_user_id")
+    if not user_id:
+        return _popup_page("oura_oauth", "error", "Session expired — please try again")
 
     resp = http.post(OURA_TOKEN_URL, data={
         "grant_type":    "authorization_code",
@@ -760,18 +792,21 @@ def oura_callback():
         return _popup_page("oura_oauth", "error", f"Token exchange failed: {resp.text}")
 
     tok = resp.json()
-    _set_tok("oura", {
+    _set_tok(user_id, "oura", {
         "access_token":  tok["access_token"],
         "refresh_token": tok.get("refresh_token", ""),
         "expires_at":    datetime.utcnow().timestamp() + tok.get("expires_in", 86400),
     })
+    session.pop("oura_state",   None)
+    session.pop("oura_user_id", None)
     return _popup_page("oura_oauth", "success", "")
 
 
 @app.route("/api/oura/sync", methods=["POST"])
+@_require_auth
 @limiter.limit("10 per minute")
 def oura_sync():
-    tok = _get_tok("oura")
+    tok = _get_tok(g.user_id, "oura")
     if not tok.get("access_token"):
         return jsonify({"error": "Not connected"}), 401
 
@@ -779,7 +814,7 @@ def oura_sync():
     week_ago = (datetime.utcnow().date() - timedelta(days=7)).isoformat()
     result: dict = {}
 
-    rd, err = _oura_get("/usercollection/daily_readiness", {"start_date": week_ago, "end_date": today})
+    rd, err = _oura_get(g.user_id, "/usercollection/daily_readiness", {"start_date": week_ago, "end_date": today})
     if err:
         return jsonify({"error": err}), 502
     readiness_records = rd.get("data", [])
@@ -787,7 +822,7 @@ def oura_sync():
         latest = readiness_records[-1]
         result["recovery"] = {"score": latest.get("score", 0)}
 
-    sl, _ = _oura_get("/usercollection/sleep", {"start_date": week_ago, "end_date": today})
+    sl, _ = _oura_get(g.user_id, "/usercollection/sleep", {"start_date": week_ago, "end_date": today})
     if sl:
         sleep_records = sl.get("data", [])
         if sleep_records:
@@ -803,15 +838,16 @@ def oura_sync():
                 result["hrv_history"] = hrv_hist
 
     last_synced = datetime.utcnow().isoformat() + "Z"
-    _set_tok("oura", {**tok, "last_synced": last_synced})
+    _set_tok(g.user_id, "oura", {**tok, "last_synced": last_synced})
     result["last_synced"] = last_synced
     return jsonify(result)
 
 
 @app.route("/api/oura/disconnect", methods=["POST"])
+@_require_auth
 @limiter.limit("10 per minute")
 def oura_disconnect():
-    _del_tok("oura")
+    _del_tok(g.user_id, "oura")
     return jsonify({"ok": True})
 
 
@@ -821,66 +857,47 @@ def oura_disconnect():
 @_require_internal
 def internal_sync_all():
     """Called by the Supabase Edge Function cron job each morning.
-    Refreshes tokens and syncs all connected wearables."""
-    results: dict = {}
+    Iterates every user's connected wearable and refreshes their data."""
+    all_rows   = _list_all_toks()
+    synced     = 0
+    errors     = 0
+    today      = datetime.utcnow().date().isoformat()
+    week_ago   = (datetime.utcnow().date() - timedelta(days=7)).isoformat()
 
-    # WHOOP
-    whoop_tok = _get_tok("whoop")
-    if whoop_tok.get("access_token"):
-        rec_data, err = _whoop_get("/recovery?limit=1")
-        if not err and rec_data:
-            records = rec_data.get("records", [])
-            if records:
-                s = records[0].get("score", {})
-                results["whoop_recovery"] = {
-                    "score": round(s.get("recovery_score", 0)),
-                    "hrv":   round(s.get("hrv_rmssd_milli", 0)),
-                    "rhr":   round(s.get("resting_heart_rate", 0)),
-                }
-        sleep_data, _ = _whoop_get("/activity/sleep?limit=1")
-        if sleep_data:
-            sleeps = sleep_data.get("records", [])
-            if sleeps:
-                stage    = sleeps[0].get("score", {}).get("stage_summary", {})
-                total_ms = (
-                    stage.get("total_light_sleep_time_milli", 0) +
-                    stage.get("total_slow_wave_sleep_time_milli", 0) +
-                    stage.get("total_rem_sleep_time_milli", 0)
-                )
-                results["whoop_sleep_hours"] = round(total_ms / 3_600_000, 1)
-        last_synced = datetime.utcnow().isoformat() + "Z"
-        _set_tok("whoop", {**whoop_tok, "last_synced": last_synced})
-        results["whoop_synced_at"] = last_synced
+    for row in all_rows:
+        uid      = row.get("user_id")
+        provider = row.get("provider")
+        if not uid or not provider:
+            continue
+        try:
+            if provider == "whoop":
+                rec_data, err = _whoop_get(uid, "/recovery?limit=1")
+                if not err and rec_data:
+                    last_synced = datetime.utcnow().isoformat() + "Z"
+                    _set_tok(uid, "whoop", {**row, "last_synced": last_synced})
+                    synced += 1
+                else:
+                    errors += 1
+            elif provider == "oura":
+                rd, err = _oura_get(uid, "/usercollection/daily_readiness",
+                                    {"start_date": week_ago, "end_date": today})
+                if not err and rd:
+                    last_synced = datetime.utcnow().isoformat() + "Z"
+                    _set_tok(uid, "oura", {**row, "last_synced": last_synced})
+                    synced += 1
+                else:
+                    errors += 1
+        except Exception as exc:
+            log.exception("sync_all_error user_id=%s provider=%s exc=%s", uid, provider, exc)
+            errors += 1
 
-    # Oura
-    oura_tok = _get_tok("oura")
-    if oura_tok.get("access_token"):
-        today    = datetime.utcnow().date().isoformat()
-        week_ago = (datetime.utcnow().date() - timedelta(days=7)).isoformat()
-        rd, err = _oura_get("/usercollection/daily_readiness",
-                            {"start_date": week_ago, "end_date": today})
-        if not err and rd:
-            readiness = rd.get("data", [])
-            if readiness:
-                results["oura_recovery"] = {"score": readiness[-1].get("score", 0)}
-        sl, _ = _oura_get("/usercollection/sleep",
-                          {"start_date": week_ago, "end_date": today})
-        if sl:
-            sleeps = sl.get("data", [])
-            if sleeps:
-                latest  = sleeps[-1]
-                hrv_avg = latest.get("average_hrv")
-                dur_sec = latest.get("total_sleep_duration")
-                if hrv_avg:
-                    results.setdefault("oura_recovery", {})["hrv"] = round(hrv_avg)
-                if dur_sec:
-                    results["oura_sleep_hours"] = round(dur_sec / 3600, 1)
-        last_synced = datetime.utcnow().isoformat() + "Z"
-        _set_tok("oura", {**oura_tok, "last_synced": last_synced})
-        results["oura_synced_at"] = last_synced
-
-    results["synced_at"] = datetime.utcnow().isoformat() + "Z"
-    return jsonify(results)
+    result = {
+        "synced_at":    datetime.utcnow().isoformat() + "Z",
+        "users_synced": synced,
+        "errors":       errors,
+    }
+    log.info("sync_all_complete synced=%d errors=%d", synced, errors)
+    return jsonify(result)
 
 
 # ── Shared OAuth popup helper ─────────────────────────────────────────────────

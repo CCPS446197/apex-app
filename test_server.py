@@ -445,6 +445,8 @@ class TestWearableSync:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestTokenRefresh:
+    _UID = "00000000-0000-0000-0000-000000000001"
+
     def test_whoop_refresh_called_when_token_expired(self):
         import server as srv
         expired_tok = {
@@ -460,7 +462,7 @@ class TestTokenRefresh:
         with mock.patch.object(srv, "_get_tok", return_value=expired_tok), \
              mock.patch.object(srv, "_set_tok") as mock_set, \
              mock.patch("server.http.post", return_value=new_tok_resp):
-            result = srv._whoop_ensure_token()
+            result = srv._whoop_ensure_token(self._UID)
         assert result == "new_tok"
         mock_set.assert_called_once()
 
@@ -470,7 +472,7 @@ class TestTokenRefresh:
         bad_resp = mock.MagicMock(ok=False)
         with mock.patch.object(srv, "_get_tok", return_value=expired), \
              mock.patch("server.http.post", return_value=bad_resp):
-            result = srv._whoop_ensure_token()
+            result = srv._whoop_ensure_token(self._UID)
         assert result is None
 
     def test_valid_token_not_refreshed(self):
@@ -479,7 +481,7 @@ class TestTokenRefresh:
                   "expires_at": 9_999_999_999.0}
         with mock.patch.object(srv, "_get_tok", return_value=future), \
              mock.patch("server.http.post") as mock_post:
-            result = srv._whoop_ensure_token()
+            result = srv._whoop_ensure_token(self._UID)
         assert result == "valid"
         mock_post.assert_not_called()
 
@@ -491,76 +493,74 @@ class TestTokenRefresh:
         with mock.patch.object(srv, "_get_tok", return_value=expired), \
              mock.patch.object(srv, "_set_tok"), \
              mock.patch("server.http.post", return_value=new_resp):
-            result = srv._oura_ensure_token()
+            result = srv._oura_ensure_token(self._UID)
         assert result == "new_oura"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Token database helpers
+# Token store helpers (Supabase REST — calls are mocked)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestTokenDB:
-    def setup_method(self):
-        """Use a temp file DB — :memory: creates a new DB per connection."""
-        import tempfile
-        import server as srv
-        self._orig_db_path = srv.DB_PATH
-        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        srv.DB_PATH = self._tmp.name
-        srv._init_db()
+class TestTokenStore:
+    """Verify _get_tok / _set_tok / _del_tok make the expected HTTP calls."""
 
-    def teardown_method(self):
-        import os as _os
-        import server as srv
-        srv.DB_PATH = self._orig_db_path
-        try:
-            _os.unlink(self._tmp.name)
-        except OSError:
-            pass
+    _UID = "00000000-0000-0000-0000-000000000001"
 
-    def test_set_and_get_token(self):
+    def test_get_tok_returns_first_row(self):
         import server as srv
-        srv._set_tok("whoop", {"access_token": "abc", "refresh_token": "ref",
-                                "expires_at": 1234.0, "last_synced": None})
-        tok = srv._get_tok("whoop")
+        row = {"user_id": self._UID, "provider": "whoop", "access_token": "abc"}
+        resp = mock.MagicMock(ok=True)
+        resp.json.return_value = [row]
+        with mock.patch("server.http.get", return_value=resp), \
+             mock.patch.object(srv, "SUPABASE_URL", "https://x.supabase.co"), \
+             mock.patch.object(srv, "SUPABASE_SERVICE_KEY", "key"):
+            tok = srv._get_tok(self._UID, "whoop")
         assert tok["access_token"] == "abc"
 
-    def test_get_missing_key_returns_empty(self):
+    def test_get_tok_returns_empty_when_not_found(self):
         import server as srv
-        assert srv._get_tok("nonexistent") == {}
+        resp = mock.MagicMock(ok=True)
+        resp.json.return_value = []
+        with mock.patch("server.http.get", return_value=resp), \
+             mock.patch.object(srv, "SUPABASE_URL", "https://x.supabase.co"), \
+             mock.patch.object(srv, "SUPABASE_SERVICE_KEY", "key"):
+            tok = srv._get_tok(self._UID, "nonexistent")
+        assert tok == {}
 
-    def test_upsert_updates_existing(self):
+    def test_set_tok_posts_to_supabase(self):
         import server as srv
-        srv._set_tok("oura", {"access_token": "old", "refresh_token": "r",
-                               "expires_at": 1.0, "last_synced": None})
-        srv._set_tok("oura", {"access_token": "new", "refresh_token": None,
-                               "expires_at": 2.0, "last_synced": None})
-        tok = srv._get_tok("oura")
-        assert tok["access_token"] == "new"
-        assert tok["refresh_token"] == "r"  # COALESCE preserves old value
+        resp = mock.MagicMock(ok=True)
+        with mock.patch("server.http.post", return_value=resp) as mock_post, \
+             mock.patch.object(srv, "SUPABASE_URL", "https://x.supabase.co"), \
+             mock.patch.object(srv, "SUPABASE_SERVICE_KEY", "key"):
+            srv._set_tok(self._UID, "whoop", {"access_token": "tok"})
+        mock_post.assert_called_once()
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["user_id"]  == self._UID
+        assert payload["provider"] == "whoop"
 
-    def test_delete_token(self):
+    def test_del_tok_deletes_from_supabase(self):
         import server as srv
-        srv._set_tok("whoop", {"access_token": "x", "refresh_token": None,
-                                "expires_at": 0, "last_synced": None})
-        srv._del_tok("whoop")
-        assert srv._get_tok("whoop") == {}
+        resp = mock.MagicMock(ok=True)
+        with mock.patch("server.http.delete", return_value=resp) as mock_del, \
+             mock.patch.object(srv, "SUPABASE_URL", "https://x.supabase.co"), \
+             mock.patch.object(srv, "SUPABASE_SERVICE_KEY", "key"):
+            srv._del_tok(self._UID, "whoop")
+        mock_del.assert_called_once()
 
-    def test_disconnect_whoop_clears_db(self, client):
+    def test_disconnect_whoop_calls_del_tok(self, client):
         import server as srv
-        srv._set_tok("whoop", {"access_token": "x", "refresh_token": None,
-                                "expires_at": 0, "last_synced": None})
-        rv = client.post("/api/whoop/disconnect")
+        with mock.patch.object(srv, "_del_tok") as mock_del:
+            rv = client.post("/api/whoop/disconnect")
         assert rv.status_code == 200
-        assert srv._get_tok("whoop") == {}
+        mock_del.assert_called_once()
 
-    def test_disconnect_oura_clears_db(self, client):
+    def test_disconnect_oura_calls_del_tok(self, client):
         import server as srv
-        srv._set_tok("oura", {"access_token": "x", "refresh_token": None,
-                               "expires_at": 0, "last_synced": None})
-        rv = client.post("/api/oura/disconnect")
+        with mock.patch.object(srv, "_del_tok") as mock_del:
+            rv = client.post("/api/oura/disconnect")
         assert rv.status_code == 200
-        assert srv._get_tok("oura") == {}
+        mock_del.assert_called_once()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

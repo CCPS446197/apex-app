@@ -1,8 +1,0 @@
-[auth]
-# Password reset / magic-link OTPs expire after 30 minutes (1800 seconds).
-# Supabase default is 3600 (1 hour); tightening to 30 min reduces the window
-# for a stolen reset link to be abused.
-otp_expiry = 1800
-
-# Disable email confirmation requirement (set to true for production if desired)
-enable_confirmations = false
